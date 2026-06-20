@@ -1,0 +1,32 @@
+# Model weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+
+# Output directories (results, masks, PNGs)
+outputs/
+
+# Dataset files — NEVER commit MIMIC-CXR or Chest ImaGenome data
+*.dcm
+*.dicom
+*.npz
+*.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# VS Code
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db

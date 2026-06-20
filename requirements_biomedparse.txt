@@ -1,0 +1,39 @@
+# requirements_biomedparse.txt
+# ─────────────────────────────────────────────────────────────────
+# Compute: NVIDIA RTX A5000 (24GB), CUDA 13.0, Driver 580.95.05
+# Python:  3.9.19 (as specified in official BiomedParse environment.yml)
+# ─────────────────────────────────────────────────────────────────
+#
+# IMPORTANT: BiomedParse requires the GitHub repo to be cloned.
+# The script (biomedparse_seg.py) MUST be placed and run from
+# inside the cloned repo directory.
+#
+# Setup (follow in order):
+#
+# Step 1 — clone repo and enter it:
+#   git clone https://github.com/microsoft/BiomedParse.git
+#   cd BiomedParse
+#
+# Step 2 — create conda env (Python 3.9.19 as per official environment.yml):
+#   conda create -n biomedparse python=3.9.19 -y
+#   conda activate biomedparse
+#
+# Step 3 — install PyTorch with CUDA 12.4 via conda
+#   (compatible with CUDA 13.0 driver):
+#   conda install pytorch torchvision torchaudio pytorch-cuda=12.4 \
+#       -c pytorch -c nvidia -y
+#
+# Step 4 — install BiomedParse dependencies (from inside the repo):
+#   pip install -r assets/requirements/requirements.txt
+#
+# Step 5 — install extra dependencies for this script:
+#   pip install -r requirements_biomedparse.txt
+#
+# Step 6 — place biomedparse_seg.py inside the BiomedParse directory and run:
+#   python biomedparse_seg.py
+# ─────────────────────────────────────────────────────────────────
+
+# Additional packages not in the BiomedParse requirements.txt
+pydicom>=2.4.0
+pandas>=2.0.0
+matplotlib>=3.7.0

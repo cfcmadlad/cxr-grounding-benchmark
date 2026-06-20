@@ -1,0 +1,29 @@
+# requirements_biovilt.txt
+# ─────────────────────────────────────────────────────────────────
+# Compute: NVIDIA RTX A5000 (24GB), CUDA 13.0, Driver 580.95.05
+# Python:  3.10
+# ─────────────────────────────────────────────────────────────────
+#
+# Setup:
+#   conda create -n biovilt python=3.10 -y
+#   conda activate biovilt
+#
+# Step 1 — PyTorch with CUDA 12.4 wheels (compatible with CUDA 13.0 driver):
+#   pip install torch>=2.4.0 torchvision --index-url https://download.pytorch.org/whl/cu124
+#
+# Step 2 — install everything else:
+#   pip install -r requirements_biovilt.txt
+# ─────────────────────────────────────────────────────────────────
+
+# hi-ml-multimodal requires transformers < 4.40 to avoid batch_encode_plus removal.
+# The script also includes a runtime patch as a safety net.
+transformers>=4.30.0,<4.40.0
+
+hi-ml-multimodal==0.2.2
+SimpleITK>=2.2.0
+pydicom>=2.4.0
+Pillow>=9.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+pandas>=2.0.0

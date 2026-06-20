@@ -1,0 +1,35 @@
+# requirements_maira2.txt
+# ─────────────────────────────────────────────────────────────────
+# Compute: NVIDIA RTX A5000 (24GB), CUDA 13.0, Driver 580.95.05
+# Python:  3.10
+# ─────────────────────────────────────────────────────────────────
+#
+# Setup:
+#   conda create -n maira2 python=3.10 -y
+#   conda activate maira2
+#
+# Step 1 — PyTorch with CUDA 12.4 wheels (compatible with CUDA 13.0 driver):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#
+# Step 2 — install everything else:
+#   pip install -r requirements_maira2.txt
+#
+# Step 3 — accept gated model access (one time only):
+#   Go to https://huggingface.co/microsoft/maira-2 and click "Agree and access repository"
+#   Then: huggingface-cli login   (paste your HF token when prompted)
+# ─────────────────────────────────────────────────────────────────
+
+# MAIRA-2 tested up to transformers 4.51.3 (per model card).
+# This conflicts with RadVLM (==4.46.0) and BioViL-T (<4.40.0) — keep separate env.
+transformers>=4.48.0,<4.52
+
+accelerate>=0.25.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+pydicom>=2.4.0
+Pillow>=9.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+pandas>=2.0.0
+huggingface_hub>=0.20.0
