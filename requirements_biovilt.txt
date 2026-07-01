@@ -15,15 +15,26 @@
 #   pip install -r requirements_biovilt.txt
 # ─────────────────────────────────────────────────────────────────
 
-# hi-ml-multimodal requires transformers < 4.40 to avoid batch_encode_plus removal.
-# The script also includes a runtime patch as a safety net.
+# hi-ml-multimodal calls tokenizer.batch_encode_plus() directly, which was
+# deprecated for years and finally REMOVED in transformers v5.0.0 (Jan 2026),
+# not in 4.40 as sometimes assumed -- 4.40+ still has it, just with a
+# deprecation warning. We still cap below 4.40 here for two reasons:
+#   1. hi-ml-multimodal 0.2.2 (last release before the repo was archived on
+#      GitHub, Nov 21 2025) was only ever tested against transformers <4.40.
+#   2. It provides a wide safety margin against the v5.0.0 removal without
+#      relying solely on the runtime batch_encode_plus shim in the script.
+# The script's runtime patch is kept as a second line of defense in case a
+# transitive dependency ever resolves transformers>=5 despite this pin.
 transformers>=4.30.0,<4.40.0
 
 hi-ml-multimodal==0.2.2
 SimpleITK>=2.2.0
 pydicom>=2.4.0
 Pillow>=9.0.0
-numpy>=1.24.0
+# hi-ml-multimodal 0.2.2 predates NumPy 2.0 (released June 2024) and was
+# never updated after the repo's Nov 2025 archival -- cap below 2.0 to
+# avoid ABI/dtype-promotion breakage in its image preprocessing code.
+numpy>=1.24.0,<2.0.0
 scipy>=1.10.0
 matplotlib>=3.7.0
 pandas>=2.0.0

@@ -25,14 +25,16 @@ Notes on MAIRA-2's phrase grounding:
     separate conda env (maira2).
 """
 
-# ── CONFIG (edit these before running) ────────────────────────────────────────
-GOLD_CSV    = "/path/to/gold_bbox.csv"      # Chest ImaGenome gold annotations
-IMAGE_DIR   = "/path/to/mimic_cxr_images"   # root folder with DICOM or JPG/PNG
-OUTPUT_DIR  = "./outputs/maira2"            # where results are saved
-MAX_IMAGES  = None                          # set to e.g. 10 for a quick test run
+import os
+
+# ── CONFIG (edit these, or override via environment variables of the same name)
+GOLD_CSV        = os.environ.get("GOLD_CSV", "/path/to/gold_bbox.csv")
+IMAGE_DIR       = os.environ.get("IMAGE_DIR", "/path/to/mimic_cxr_images")
+OUTPUT_DIR      = os.environ.get("OUTPUT_DIR", "./outputs/maira2")
+_max_images_env = os.environ.get("MAX_IMAGES")
+MAX_IMAGES      = int(_max_images_env) if _max_images_env else None
 # ──────────────────────────────────────────────────────────────────────────────
 
-import os
 import json
 import warnings
 warnings.filterwarnings("ignore")
@@ -49,6 +51,8 @@ from PIL import Image
 import torch
 from transformers import AutoModelForCausalLM, AutoProcessor
 from transformers import SamModel, SamProcessor
+
+from cxr_common import load_image, find_image_file, box_iou, union_box
 
 # ── 15 TARGET REGIONS ─────────────────────────────────────────────────────────
 REGIONS = [
@@ -121,6 +125,14 @@ def maira_ground_phrase(pil_image, phrase):
     Box coordinates from MAIRA-2 are normalized and relative to the
     internally cropped image. processor.adjust_box_for_original_image_size
     converts them back to original image pixel coordinates.
+
+    Edge case: for phrases describing paired/bilateral or repeated
+    structures, MAIRA-2 can legitimately return MORE THAN ONE box for a
+    single phrase (e.g. "left hilar structures" occasionally grounds as
+    two separate components). Since the gold annotation is always a
+    single box per region, we take the union (smallest enclosing box) of
+    every returned box rather than silently keeping only boxes[0] and
+    discarding the rest.
     """
     processed_inputs = maira_processor.format_and_preprocess_phrase_grounding_input(
         frontal_image=pil_image,
@@ -144,7 +156,7 @@ def maira_ground_phrase(pil_image, phrase):
     prediction = maira_processor.convert_output_to_plaintext_or_grounded_sequence(decoded_text)
 
     # prediction is a list of (text, boxes_or_None) tuples
-    # For phrase grounding it's typically one tuple: ('phrase text.', [(x1,y1,x2,y2)])
+    # For phrase grounding it's typically one tuple: ('phrase text.', [(x1,y1,x2,y2), ...])
     if not prediction:
         return None, decoded_text
 
@@ -152,15 +164,19 @@ def maira_ground_phrase(pil_image, phrase):
     if not boxes:
         return None, decoded_text
 
-    # Take the first (usually only) box and adjust for original image size
-    raw_box = boxes[0]  # normalized coords relative to MAIRA-2's cropped view
-    adjusted = maira_processor.adjust_box_for_original_image_size(
-        box=raw_box,
-        original_image=pil_image,
-    )
-    # adjusted is (x1, y1, x2, y2) in pixel coords of the original image
-    x1, y1, x2, y2 = adjusted
-    return [int(x1), int(y1), int(x2), int(y2)], decoded_text
+    # Adjust every returned box (normalized coords relative to MAIRA-2's
+    # cropped view) back to original-image pixel coordinates, then take
+    # the union if there's more than one.
+    adjusted_boxes = []
+    for raw_box in boxes:
+        x1, y1, x2, y2 = maira_processor.adjust_box_for_original_image_size(
+            box=raw_box,
+            original_image=pil_image,
+        )
+        adjusted_boxes.append([int(x1), int(y1), int(x2), int(y2)])
+
+    final_box = adjusted_boxes[0] if len(adjusted_boxes) == 1 else union_box(adjusted_boxes)
+    return final_box, decoded_text
 
 # ── MEDSAM SEGMENTATION ───────────────────────────────────────────────────────
 
@@ -176,48 +192,6 @@ def get_medsam_mask(pil_image, box_xyxy):
         inputs["reshaped_input_sizes"].cpu(),
     )
     return masks[0].squeeze().numpy().astype(bool)
-
-# ── IoU / DICE ────────────────────────────────────────────────────────────────
-
-def box_iou(pred, gold):
-    ix1 = max(pred[0], gold[0])
-    iy1 = max(pred[1], gold[1])
-    ix2 = min(pred[2], gold[2])
-    iy2 = min(pred[3], gold[3])
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    if inter == 0:
-        return 0.0
-    area_pred = (pred[2] - pred[0]) * (pred[3] - pred[1])
-    area_gold = (gold[2] - gold[0]) * (gold[3] - gold[1])
-    return inter / (area_pred + area_gold - inter)
-
-# ── IMAGE LOADING ─────────────────────────────────────────────────────────────
-
-def load_image(path):
-    path = str(path)
-    if path.lower().endswith((".dcm", ".dicom")):
-        try:
-            import pydicom
-        except ImportError:
-            raise ImportError("pip install pydicom")
-        ds = pydicom.dcmread(path)
-        arr = ds.pixel_array.astype(float)
-        if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
-            arr = arr.max() - arr
-        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8) * 255
-        return Image.fromarray(arr.astype(np.uint8)).convert("RGB")
-    return Image.open(path).convert("RGB")
-
-def find_image_file(image_dir, image_id):
-    image_dir = Path(image_dir)
-    for ext in [".jpg", ".jpeg", ".png", ".dcm", ".dicom"]:
-        p = image_dir / f"{image_id}{ext}"
-        if p.exists():
-            return p
-        matches = list(image_dir.rglob(f"{image_id}{ext}"))
-        if matches:
-            return matches[0]
-    return None
 
 # ── PER-REGION VISUALIZATION ──────────────────────────────────────────────────
 
@@ -320,7 +294,7 @@ def main():
     print(f"\nLoading gold annotations from {GOLD_CSV}...")
     gold_annotations = load_gold_annotations(GOLD_CSV)
     image_ids = list(gold_annotations.keys())
-    if MAX_IMAGES:
+    if MAX_IMAGES is not None:
         image_ids = image_ids[:MAX_IMAGES]
     print(f"{len(image_ids)} images to process.")
 

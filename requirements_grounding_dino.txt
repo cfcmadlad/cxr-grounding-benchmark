@@ -21,9 +21,14 @@
 # No gated HF access needed — both models are fully open.
 # ─────────────────────────────────────────────────────────────────
 
-# No strict version pin needed — Grounding DINO works with current transformers.
-# Tested range: 4.38+
-transformers>=4.38.0
+# Grounding DINO (GroundingDinoForObjectDetection / post_process_grounded_
+# object_detection) was merged into transformers on 2024-04-11 and first
+# shipped in the 4.40.0 release -- it does NOT exist in 4.38/4.39, despite
+# earlier guidance in this file suggesting 4.38+. Pin to >=4.40.0.
+# (transformers 4.51.0 changed post_process_grounded_object_detection to
+# return integer label ids instead of strings in some paths; harmless here
+# since we only use `scores`/`boxes`, but noted for anyone parsing `labels`.)
+transformers>=4.40.0
 
 accelerate>=0.25.0
 pydicom>=2.4.0

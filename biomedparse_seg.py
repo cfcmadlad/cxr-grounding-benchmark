@@ -7,11 +7,13 @@ on the Chest ImaGenome gold subset.
 IMPORTANT — this script is structurally different from the others.
 BiomedParse uses custom model classes (BaseModel, build_model, etc.) that are
 not available as a pip package. The script MUST be placed and run from inside
-the cloned BiomedParse repository directory:
+the cloned BiomedParse repository directory, and cxr_common.py (the shared
+image loader / IoU / Dice helpers used by every script in this benchmark)
+MUST be copied alongside it:
 
     git clone https://github.com/microsoft/BiomedParse.git
     cd BiomedParse
-    # place this script here, then run it
+    # copy biomedparse_seg.py AND cxr_common.py here, then run it
 
 Requirements: see requirements_biomedparse.txt (uses conda env 'biomedparse',
 Python 3.9.19 as specified in the official BiomedParse environment.yml)
@@ -24,15 +26,17 @@ Key difference from other scripts:
   - Output scores are sigmoid logits; threshold at 0.5 for binary mask.
 """
 
-# ── CONFIG (edit these before running) ────────────────────────────────────────
-GOLD_CSV    = "/path/to/gold_bbox.csv"      # Chest ImaGenome gold annotations
-IMAGE_DIR   = "/path/to/mimic_cxr_images"   # root folder with DICOM or JPG/PNG
-OUTPUT_DIR  = "./outputs/biomedparse"       # where results are saved
-MAX_IMAGES  = None                          # set to e.g. 10 for a quick test run
-MASK_THRESHOLD = 0.5                        # sigmoid threshold for binary mask
+import os
+
+# ── CONFIG (edit these, or override via environment variables of the same name)
+GOLD_CSV        = os.environ.get("GOLD_CSV", "/path/to/gold_bbox.csv")
+IMAGE_DIR       = os.environ.get("IMAGE_DIR", "/path/to/mimic_cxr_images")
+OUTPUT_DIR      = os.environ.get("OUTPUT_DIR", "./outputs/biomedparse")
+_max_images_env = os.environ.get("MAX_IMAGES")
+MAX_IMAGES      = int(_max_images_env) if _max_images_env else None
+MASK_THRESHOLD  = float(os.environ.get("MASK_THRESHOLD", 0.5))
 # ──────────────────────────────────────────────────────────────────────────────
 
-import os
 import json
 import warnings
 warnings.filterwarnings("ignore")
@@ -47,6 +51,8 @@ from pathlib import Path
 from PIL import Image
 
 import torch
+
+from cxr_common import load_image, find_image_file, box_iou, mask_dice
 
 # BiomedParse custom classes — these only work when the script is run
 # from inside the cloned BiomedParse repo directory.
@@ -134,65 +140,24 @@ def mask_to_box(binary_mask):
     ys, xs = np.where(binary_mask)
     if len(xs) == 0:
         return None
-    return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
-
-def mask_dice(pred_mask, gold_mask):
-    """Dice coefficient between two boolean masks."""
-    pred_bool = pred_mask.astype(bool)
-    gold_bool = gold_mask.astype(bool)
-    intersection = (pred_bool & gold_bool).sum()
-    denom = pred_bool.sum() + gold_bool.sum()
-    if denom == 0:
-        return 0.0
-    return 2 * intersection / denom
-
-def box_iou(pred, gold):
-    """IoU between two [x1,y1,x2,y2] boxes."""
-    ix1 = max(pred[0], gold[0])
-    iy1 = max(pred[1], gold[1])
-    ix2 = min(pred[2], gold[2])
-    iy2 = min(pred[3], gold[3])
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    if inter == 0:
-        return 0.0
-    area_pred = (pred[2] - pred[0]) * (pred[3] - pred[1])
-    area_gold = (gold[2] - gold[0]) * (gold[3] - gold[1])
-    return inter / (area_pred + area_gold - inter)
+    # +1 on the upper bound: xs.max()/ys.max() are the last INCLUDED
+    # pixel index, but gold boxes (built as [x, y, x+w, y+h]) and every
+    # other model's boxes in this benchmark use an EXCLUSIVE upper bound.
+    # Without +1, every BiomedParse-derived box was 1 pixel too narrow.
+    return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
 
 def gold_box_to_mask(gold_box, img_h, img_w):
     """Convert gold box [x1,y1,x2,y2] to a binary mask for Dice scoring."""
     mask = np.zeros((img_h, img_w), dtype=bool)
     x1, y1, x2, y2 = [int(v) for v in gold_box]
+    # Clamp to valid array bounds: a negative x1/y1 would otherwise be
+    # interpreted by numpy as a from-the-end slice index (e.g. mask[-5:10]
+    # selects from the end of the array), silently producing a wildly
+    # wrong mask instead of the intended top-left-anchored box.
+    x1, x2 = max(0, x1), min(img_w, x2)
+    y1, y2 = max(0, y1), min(img_h, y2)
     mask[y1:y2, x1:x2] = True
     return mask
-
-# ── IMAGE LOADING ─────────────────────────────────────────────────────────────
-
-def load_image(path):
-    path = str(path)
-    if path.lower().endswith((".dcm", ".dicom")):
-        try:
-            import pydicom
-        except ImportError:
-            raise ImportError("pip install pydicom")
-        ds = pydicom.dcmread(path)
-        arr = ds.pixel_array.astype(float)
-        if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
-            arr = arr.max() - arr
-        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8) * 255
-        return Image.fromarray(arr.astype(np.uint8)).convert("RGB")
-    return Image.open(path).convert("RGB")
-
-def find_image_file(image_dir, image_id):
-    image_dir = Path(image_dir)
-    for ext in [".jpg", ".jpeg", ".png", ".dcm", ".dicom"]:
-        p = image_dir / f"{image_id}{ext}"
-        if p.exists():
-            return p
-        matches = list(image_dir.rglob(f"{image_id}{ext}"))
-        if matches:
-            return matches[0]
-    return None
 
 # ── PER-REGION VISUALIZATION ──────────────────────────────────────────────────
 
@@ -305,7 +270,7 @@ def main():
     print(f"\nLoading gold annotations from {GOLD_CSV}...")
     gold_annotations = load_gold_annotations(GOLD_CSV)
     image_ids = list(gold_annotations.keys())
-    if MAX_IMAGES:
+    if MAX_IMAGES is not None:
         image_ids = image_ids[:MAX_IMAGES]
     print(f"{len(image_ids)} images to process.")
 
@@ -337,6 +302,17 @@ def main():
                 )
         except Exception as e:
             print(f"  BiomedParse inference error: {e}, skipping image.")
+            continue
+
+        if len(pred_masks_raw) != len(REGIONS):
+            # zip() below would otherwise silently truncate to the
+            # shorter list, dropping some regions from this image's
+            # results with no error or warning at all.
+            print(
+                f"  WARNING: BiomedParse returned {len(pred_masks_raw)} masks "
+                f"for {len(REGIONS)} region prompts -- results for this image "
+                f"may be misaligned/incomplete, skipping."
+            )
             continue
 
         per_image_masks = {}

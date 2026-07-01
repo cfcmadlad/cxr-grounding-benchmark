@@ -17,16 +17,17 @@ RadVLM weights must be downloaded from PhysioNet:
 Set RADVLM_PATH below to the folder containing those weights.
 """
 
-# ── CONFIG (edit these before running) ────────────────────────────────────────
-RADVLM_PATH   = "/path/to/radvlm/weights"   # local folder with RadVLM weights
-GOLD_CSV      = "/path/to/gold_bbox.csv"     # Chest ImaGenome gold annotations
-IMAGE_DIR     = "/path/to/mimic_cxr_images"  # root folder with DICOM or JPG/PNG
-OUTPUT_DIR    = "./outputs/radvlm"           # where results are saved
-MAX_IMAGES    = None                         # set to e.g. 10 to do a quick test run
+import os
+
+# ── CONFIG (edit these, or override via environment variables of the same name)
+RADVLM_PATH     = os.environ.get("RADVLM_PATH", "/path/to/radvlm/weights")
+GOLD_CSV        = os.environ.get("GOLD_CSV", "/path/to/gold_bbox.csv")
+IMAGE_DIR       = os.environ.get("IMAGE_DIR", "/path/to/mimic_cxr_images")
+OUTPUT_DIR      = os.environ.get("OUTPUT_DIR", "./outputs/radvlm")
+_max_images_env = os.environ.get("MAX_IMAGES")
+MAX_IMAGES      = int(_max_images_env) if _max_images_env else None
 # ──────────────────────────────────────────────────────────────────────────────
 
-import os
-import re
 import json
 import warnings
 warnings.filterwarnings("ignore")
@@ -43,6 +44,10 @@ from PIL import Image
 import torch
 from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
 from transformers import SamModel, SamProcessor
+
+from cxr_common import (
+    load_image, find_image_file, box_iou, mask_dice, parse_box_from_response,
+)
 
 # ── 15 TARGET REGIONS ─────────────────────────────────────────────────────────
 REGIONS = [
@@ -143,44 +148,44 @@ def inference_radvlm(model, processor, image, prompt, chat_history=None, max_new
         images=image, text=full_prompt, return_tensors="pt", padding=True
     ).to(model.device, torch.float16)
 
+    prompt_length = inputs["input_ids"].shape[-1]
+
     with torch.inference_mode():
         output = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
 
-    full_response = processor.decode(output[0], skip_special_tokens=True)
-    response = re.split(r"(user|assistant)", full_response)[-1].strip()
+    # Decode only the newly generated tokens (slicing by prompt_length in
+    # token space), instead of decoding the full prompt+completion output
+    # and trying to strip the chat-template role markers back out with
+    # re.split(r"(user|assistant)", ...). That approach had two real bugs:
+    #   1. It's case-sensitive and only matches lowercase "user"/
+    #      "assistant". LLaVA/Vicuna-style chat templates (which
+    #      LlavaOnevisionForConditionalGeneration -- RadVLM's architecture
+    #      -- commonly uses) render roles as "USER"/"ASSISTANT"
+    #      (uppercase), which this pattern never matches, silently
+    #      leaving the FULL prompt template concatenated in front of the
+    #      real answer in `response`.
+    #   2. Even when it does match, splitting on bare substrings "user"/
+    #      "assistant" anywhere in the decoded text is fragile -- it can
+    #      never be fully safe against those substrings appearing
+    #      elsewhere (e.g. inside prior turns replayed in multi-turn
+    #      history).
+    # Slicing by prompt_length sidesteps both problems entirely and
+    # matches the same fix applied to MAIRA-2 and CheXagent in this
+    # benchmark.
+    response = processor.decode(
+        output[0][prompt_length:], skip_special_tokens=True
+    ).strip()
     chat_history.append((prompt, response))
     return response, chat_history
 
 # ── BOX PARSING ───────────────────────────────────────────────────────────────
-
-def parse_box_from_response(response, img_w, img_h):
-    """
-    RadVLM outputs boxes as normalized [0,1] coordinates in its text response.
-    This function tries multiple patterns to be robust to minor format variations.
-    Returns [x1, y1, x2, y2] in pixel coordinates, or None if parsing fails.
-    """
-    # Try bracket format: [0.1, 0.2, 0.8, 0.9] or [0.1 0.2 0.8 0.9]
-    patterns = [
-        r"\[([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)\]",
-        r"\(([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)\)",
-        r"([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, response)
-        if match:
-            vals = [float(match.group(i)) for i in range(1, 5)]
-            # If values look normalized (all <= 1.0), scale to pixels
-            if all(v <= 1.0 for v in vals):
-                x1 = int(vals[0] * img_w)
-                y1 = int(vals[1] * img_h)
-                x2 = int(vals[2] * img_w)
-                y2 = int(vals[3] * img_h)
-            else:
-                x1, y1, x2, y2 = [int(v) for v in vals]
-            # Sanity check
-            if x2 > x1 and y2 > y1:
-                return [x1, y1, x2, y2]
-    return None
+#
+# RadVLM outputs boxes as normalized [0,1] coordinates in free text, e.g.
+# "[0.12, 0.34, 0.56, 0.78]" (confirmed against the RadVLM paper/repo).
+# parse_box_from_response() (imported from cxr_common) tries this format
+# plus several fallback formats (paired parens, bare numbers, 0-100/0-1000
+# scales) so a single robust parser is shared across every VLM script in
+# this benchmark instead of duplicating slightly-diverging regex logic.
 
 # ── MEDSAM SEGMENTATION ───────────────────────────────────────────────────────
 
@@ -196,60 +201,6 @@ def get_medsam_mask(pil_image, box_xyxy):
         inputs["reshaped_input_sizes"].cpu(),
     )
     return masks[0].squeeze().numpy().astype(bool)
-
-# ── IoU / DICE ────────────────────────────────────────────────────────────────
-
-def box_iou(pred, gold):
-    """Both boxes are [x1, y1, x2, y2] in pixels."""
-    ix1 = max(pred[0], gold[0])
-    iy1 = max(pred[1], gold[1])
-    ix2 = min(pred[2], gold[2])
-    iy2 = min(pred[3], gold[3])
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    if inter == 0:
-        return 0.0
-    area_pred = (pred[2] - pred[0]) * (pred[3] - pred[1])
-    area_gold = (gold[2] - gold[0]) * (gold[3] - gold[1])
-    return inter / (area_pred + area_gold - inter)
-
-def mask_dice(pred_mask, gold_mask):
-    intersection = (pred_mask & gold_mask).sum()
-    if intersection == 0:
-        return 0.0
-    return 2 * intersection / (pred_mask.sum() + gold_mask.sum())
-
-# ── IMAGE LOADING (DICOM + JPG/PNG) ──────────────────────────────────────────
-
-def load_image(path):
-    """Returns a PIL RGB image regardless of whether input is DICOM or JPG/PNG."""
-    path = str(path)
-    if path.lower().endswith((".dcm", ".dicom")):
-        try:
-            import pydicom
-        except ImportError:
-            raise ImportError("pydicom is required for DICOM files: pip install pydicom")
-        ds = pydicom.dcmread(path)
-        arr = ds.pixel_array.astype(float)
-        if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
-            arr = arr.max() - arr
-        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8) * 255
-        return Image.fromarray(arr.astype(np.uint8)).convert("RGB")
-    else:
-        return Image.open(path).convert("RGB")
-
-def find_image_file(image_dir, image_id):
-    """Find an image file by ID, checking common extensions."""
-    image_dir = Path(image_dir)
-    for ext in [".jpg", ".jpeg", ".png", ".dcm", ".dicom"]:
-        # flat
-        p = image_dir / f"{image_id}{ext}"
-        if p.exists():
-            return p
-        # one level deep (MIMIC-CXR has p10/p10xxxxxx/sXXXX/image.jpg structure)
-        matches = list(image_dir.rglob(f"{image_id}{ext}"))
-        if matches:
-            return matches[0]
-    return None
 
 # ── PER-REGION VISUALIZATION ──────────────────────────────────────────────────
 
@@ -355,7 +306,7 @@ def main():
     print(f"\nLoading gold annotations from {GOLD_CSV}...")
     gold_annotations = load_gold_annotations(GOLD_CSV)
     image_ids = list(gold_annotations.keys())
-    if MAX_IMAGES:
+    if MAX_IMAGES is not None:
         image_ids = image_ids[:MAX_IMAGES]
     print(f"{len(image_ids)} images to process.")
 
@@ -423,7 +374,8 @@ def main():
             if pred_box and gold_box:
                 iou = box_iou(pred_box, gold_box)
 
-            print(f"  {region}: pred={pred_box}  gold={gold_box}  IoU={iou:.3f if iou is not None else 'N/A'}")
+            iou_str = f"{iou:.3f}" if iou is not None else "N/A"
+            print(f"  {region}: pred={pred_box}  gold={gold_box}  IoU={iou_str}")
 
             # Save per-region PNG
             save_region_png(
