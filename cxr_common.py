@@ -42,7 +42,11 @@ def _dicom_to_pil(path):
     arr = ds.pixel_array
 
     # Multi-frame DICOM: keep only the first frame.
-    if arr.ndim == 3 and arr.shape[-1] not in (3, 4):
+    #   grayscale multi-frame -> (frames, H, W)          ndim == 3
+    #   color multi-frame     -> (frames, H, W, samples)  ndim == 4
+    if arr.ndim == 4:
+        arr = arr[0]
+    elif arr.ndim == 3 and arr.shape[-1] not in (3, 4):
         arr = arr[0]
 
     arr = arr.astype(np.float64)
@@ -164,20 +168,47 @@ _BRACKETED_PATTERNS = [
 
 
 def _finalize_box(vals, img_w, img_h, scale_hint=None):
-    """Turn 4 raw numbers into a pixel-space [x1,y1,x2,y2] box, or None."""
+    """Turn 4 raw numbers into a pixel-space [x1,y1,x2,y2] box, or None.
+
+    Note: a "0-1000 quantized scale" branch (used by some instruction-tuned
+    VLMs, e.g. Qwen-VL-style <box> tags) was deliberately NOT added here.
+    The obvious heuristic -- treat values <=1000 as quantized coordinates
+    when they exceed the image's actual pixel dimensions -- is unreachable
+    for this benchmark's actual images: MIMIC-CXR frames are typically
+    2000-3000px per side, so legitimate 0-1000-scale coordinates (whose
+    max value is by definition <=1000) never exceed img_w/img_h and would
+    never trigger such a check, while for a hypothetically small image
+    that heuristic would misfire on ordinary raw pixel coordinates. None
+    of the models actually used here (RadVLM: 0-1 floats, CheXagent:
+    0-100 <|box|> tags handled separately above) emit 0-1000-scale boxes,
+    so raw pixel coordinates is the correct and only fallback below.
+    """
     if scale_hint == "pct100":
         x1, y1, x2, y2 = (v / 100.0 for v in vals)
         x1, y1, x2, y2 = x1 * img_w, y1 * img_h, x2 * img_w, y2 * img_h
-    elif all(0.0 <= v <= 1.0 for v in vals):
+    elif all(-0.05 <= v <= 1.05 for v in vals):
+        # Normalized-0..1 detection uses a small rounding-slop margin
+        # (+/-0.05) rather than a strict [0.0, 1.0] gate: a VLM regularly
+        # emits a coordinate like 1.02 for a box that touches the right/
+        # bottom edge of the image (float rounding in the model's own
+        # normalization). Rejecting the WHOLE box just because one of its
+        # 4 values is barely over 1.0 -- and silently reinterpreting all
+        # 4 values as raw pixel coordinates instead -- produced a
+        # degenerate near-zero-pixel box instead of the correct
+        # near-full-size one. Each value is clamped to [0, 1] individually
+        # right after this branch decides "yes, this is normalized scale".
+        vals = [min(max(v, 0.0), 1.0) for v in vals]
         x1, y1, x2, y2 = vals[0] * img_w, vals[1] * img_h, vals[2] * img_w, vals[3] * img_h
-    elif all(0.0 <= v <= 1000.0 for v in vals) and max(vals) > img_w and max(vals) > img_h:
-        # Common 0-1000 quantized-coordinate convention used by several
-        # instruction-tuned VLMs (e.g. Qwen-VL-style <box>) when the raw
-        # values clearly exceed the image's actual pixel dimensions.
-        x1, y1, x2, y2 = (v / 1000.0 for v in vals)
-        x1, y1, x2, y2 = x1 * img_w, y1 * img_h, x2 * img_w, y2 * img_h
     else:
         x1, y1, x2, y2 = vals
+
+    # Clamp to image bounds so a slightly out-of-range model output can
+    # never produce negative-index slicing bugs or out-of-bounds crops
+    # downstream (e.g. MedSAM prompts, mask array indexing).
+    x1 = min(max(x1, 0), img_w)
+    y1 = min(max(y1, 0), img_h)
+    x2 = min(max(x2, 0), img_w)
+    y2 = min(max(y2, 0), img_h)
 
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
     if x2 > x1 and y2 > y1:
@@ -221,6 +252,14 @@ def parse_box_from_response(response, img_w, img_h):
 
 def box_iou(pred, gold):
     """IoU between two [x1, y1, x2, y2] boxes."""
+    area_pred = (pred[2] - pred[0]) * (pred[3] - pred[1])
+    area_gold = (gold[2] - gold[0]) * (gold[3] - gold[1])
+    if area_pred <= 0 or area_gold <= 0:
+        # Degenerate/zero-area box (e.g. a malformed upstream box) -- no
+        # meaningful overlap can be computed; treat as no match rather
+        # than let a negative area silently produce a nonsensical ratio.
+        return 0.0
+
     ix1 = max(pred[0], gold[0])
     iy1 = max(pred[1], gold[1])
     ix2 = min(pred[2], gold[2])
@@ -228,8 +267,6 @@ def box_iou(pred, gold):
     inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
     if inter == 0:
         return 0.0
-    area_pred = (pred[2] - pred[0]) * (pred[3] - pred[1])
-    area_gold = (gold[2] - gold[0]) * (gold[3] - gold[1])
     return inter / (area_pred + area_gold - inter)
 
 

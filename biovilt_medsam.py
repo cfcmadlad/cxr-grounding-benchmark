@@ -152,7 +152,12 @@ def heatmap_to_box(sim_map, percentile=PERCENTILE):
     largest_label = int(np.argmax(sizes)) + 1
     component = labeled == largest_label
     ys, xs = np.where(component)
-    box = [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
+    # +1 on the upper bound: xs.max()/ys.max() are the last INCLUDED pixel
+    # index, but every box elsewhere in this benchmark (gold boxes built
+    # as [x, y, x+w, y+h], MedSAM/Grounding DINO/VLM boxes) uses an
+    # EXCLUSIVE upper bound. Without +1 here, every BioViL-T box was 1
+    # pixel too narrow/short compared to gold and to every other model.
+    box = [float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)]
     peak_score = float(finite_vals.max())
     return box, peak_score
 
@@ -271,7 +276,7 @@ def main():
     print(f"\nLoading gold annotations from {GOLD_CSV}...")
     gold_annotations = load_gold_annotations(GOLD_CSV)
     image_ids = list(gold_annotations.keys())
-    if MAX_IMAGES:
+    if MAX_IMAGES is not None:
         image_ids = image_ids[:MAX_IMAGES]
     print(f"{len(image_ids)} images to process.")
 
@@ -293,7 +298,11 @@ def main():
 
         # BioViL-T needs the image saved to a temp path (API takes file path)
         tmp_path = Path(OUTPUT_DIR) / f"_tmp_{image_id}.png"
-        pil_img.save(tmp_path)
+        try:
+            pil_img.save(tmp_path)
+        except Exception as e:
+            print(f"  Failed to write temp image for BioViL-T: {e}, skipping.")
+            continue
 
         per_image_boxes = {}
         per_image_masks = {}

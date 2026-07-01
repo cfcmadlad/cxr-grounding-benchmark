@@ -144,13 +144,26 @@ def chexagent_ground_phrase(pil_image, phrase, print_raw=False):
         return_tensors="pt",
     ).to(device=DEVICE, dtype=torch.float16)
 
+    prompt_length = inputs["input_ids"].shape[-1]
+
     with torch.no_grad():
         output = chexagent_model.generate(
             **inputs,
             generation_config=generation_config,
         )[0]
 
-    response = processor.tokenizer.decode(output, skip_special_tokens=True)
+    # AutoModelForCausalLM.generate() returns the full prompt+completion
+    # sequence, not just the newly generated tokens. Decoding `output` in
+    # full (as opposed to `output[prompt_length:]`) means `response` is
+    # dominated by the ECHOED PROMPT TEXT -- including the literal
+    # instruction "Provide the bounding box as [x1, y1, x2, y2]" -- so the
+    # first ~150+ characters of both the debug print and the raw_response
+    # saved to JSON were the prompt being read back, not CheXagent's
+    # actual answer. Slicing off the prompt tokens before decoding fixes
+    # this (same pattern already used correctly in maira2_medsam.py).
+    response = processor.tokenizer.decode(
+        output[prompt_length:], skip_special_tokens=True
+    )
 
     if print_raw:
         print(f"    RAW RESPONSE for '{phrase}': {response[:200]}")
@@ -282,7 +295,7 @@ def main():
     print(f"\nLoading gold annotations from {GOLD_CSV}...")
     gold_annotations = load_gold_annotations(GOLD_CSV)
     image_ids = list(gold_annotations.keys())
-    if MAX_IMAGES:
+    if MAX_IMAGES is not None:
         image_ids = image_ids[:MAX_IMAGES]
     print(f"{len(image_ids)} images to process.")
 

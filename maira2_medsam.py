@@ -294,7 +294,7 @@ def main():
     print(f"\nLoading gold annotations from {GOLD_CSV}...")
     gold_annotations = load_gold_annotations(GOLD_CSV)
     image_ids = list(gold_annotations.keys())
-    if MAX_IMAGES:
+    if MAX_IMAGES is not None:
         image_ids = image_ids[:MAX_IMAGES]
     print(f"{len(image_ids)} images to process.")
 

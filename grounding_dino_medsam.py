@@ -267,7 +267,7 @@ def main():
     print(f"\nLoading gold annotations from {GOLD_CSV}...")
     gold_annotations = load_gold_annotations(GOLD_CSV)
     image_ids = list(gold_annotations.keys())
-    if MAX_IMAGES:
+    if MAX_IMAGES is not None:
         image_ids = image_ids[:MAX_IMAGES]
     print(f"{len(image_ids)} images to process.")
 
@@ -320,7 +320,7 @@ def main():
                 iou = box_iou(pred_box, gold_box)
 
             print(
-                f"  {region}: score={f'{score:.3f}' if score else 'N/A'}"
+                f"  {region}: score={f'{score:.3f}' if score is not None else 'N/A'}"
                 f"  IoU={f'{iou:.3f}' if iou is not None else 'N/A'}"
                 f"  pred={pred_box}"
             )

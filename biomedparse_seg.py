@@ -140,12 +140,22 @@ def mask_to_box(binary_mask):
     ys, xs = np.where(binary_mask)
     if len(xs) == 0:
         return None
-    return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+    # +1 on the upper bound: xs.max()/ys.max() are the last INCLUDED
+    # pixel index, but gold boxes (built as [x, y, x+w, y+h]) and every
+    # other model's boxes in this benchmark use an EXCLUSIVE upper bound.
+    # Without +1, every BiomedParse-derived box was 1 pixel too narrow.
+    return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
 
 def gold_box_to_mask(gold_box, img_h, img_w):
     """Convert gold box [x1,y1,x2,y2] to a binary mask for Dice scoring."""
     mask = np.zeros((img_h, img_w), dtype=bool)
     x1, y1, x2, y2 = [int(v) for v in gold_box]
+    # Clamp to valid array bounds: a negative x1/y1 would otherwise be
+    # interpreted by numpy as a from-the-end slice index (e.g. mask[-5:10]
+    # selects from the end of the array), silently producing a wildly
+    # wrong mask instead of the intended top-left-anchored box.
+    x1, x2 = max(0, x1), min(img_w, x2)
+    y1, y2 = max(0, y1), min(img_h, y2)
     mask[y1:y2, x1:x2] = True
     return mask
 
@@ -260,7 +270,7 @@ def main():
     print(f"\nLoading gold annotations from {GOLD_CSV}...")
     gold_annotations = load_gold_annotations(GOLD_CSV)
     image_ids = list(gold_annotations.keys())
-    if MAX_IMAGES:
+    if MAX_IMAGES is not None:
         image_ids = image_ids[:MAX_IMAGES]
     print(f"{len(image_ids)} images to process.")
 
@@ -292,6 +302,17 @@ def main():
                 )
         except Exception as e:
             print(f"  BiomedParse inference error: {e}, skipping image.")
+            continue
+
+        if len(pred_masks_raw) != len(REGIONS):
+            # zip() below would otherwise silently truncate to the
+            # shorter list, dropping some regions from this image's
+            # results with no error or warning at all.
+            print(
+                f"  WARNING: BiomedParse returned {len(pred_masks_raw)} masks "
+                f"for {len(REGIONS)} region prompts -- results for this image "
+                f"may be misaligned/incomplete, skipping."
+            )
             continue
 
         per_image_masks = {}

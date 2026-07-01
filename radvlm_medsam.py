@@ -28,7 +28,6 @@ _max_images_env = os.environ.get("MAX_IMAGES")
 MAX_IMAGES      = int(_max_images_env) if _max_images_env else None
 # ──────────────────────────────────────────────────────────────────────────────
 
-import re
 import json
 import warnings
 warnings.filterwarnings("ignore")
@@ -149,11 +148,33 @@ def inference_radvlm(model, processor, image, prompt, chat_history=None, max_new
         images=image, text=full_prompt, return_tensors="pt", padding=True
     ).to(model.device, torch.float16)
 
+    prompt_length = inputs["input_ids"].shape[-1]
+
     with torch.inference_mode():
         output = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
 
-    full_response = processor.decode(output[0], skip_special_tokens=True)
-    response = re.split(r"(user|assistant)", full_response)[-1].strip()
+    # Decode only the newly generated tokens (slicing by prompt_length in
+    # token space), instead of decoding the full prompt+completion output
+    # and trying to strip the chat-template role markers back out with
+    # re.split(r"(user|assistant)", ...). That approach had two real bugs:
+    #   1. It's case-sensitive and only matches lowercase "user"/
+    #      "assistant". LLaVA/Vicuna-style chat templates (which
+    #      LlavaOnevisionForConditionalGeneration -- RadVLM's architecture
+    #      -- commonly uses) render roles as "USER"/"ASSISTANT"
+    #      (uppercase), which this pattern never matches, silently
+    #      leaving the FULL prompt template concatenated in front of the
+    #      real answer in `response`.
+    #   2. Even when it does match, splitting on bare substrings "user"/
+    #      "assistant" anywhere in the decoded text is fragile -- it can
+    #      never be fully safe against those substrings appearing
+    #      elsewhere (e.g. inside prior turns replayed in multi-turn
+    #      history).
+    # Slicing by prompt_length sidesteps both problems entirely and
+    # matches the same fix applied to MAIRA-2 and CheXagent in this
+    # benchmark.
+    response = processor.decode(
+        output[0][prompt_length:], skip_special_tokens=True
+    ).strip()
     chat_history.append((prompt, response))
     return response, chat_history
 
@@ -285,7 +306,7 @@ def main():
     print(f"\nLoading gold annotations from {GOLD_CSV}...")
     gold_annotations = load_gold_annotations(GOLD_CSV)
     image_ids = list(gold_annotations.keys())
-    if MAX_IMAGES:
+    if MAX_IMAGES is not None:
         image_ids = image_ids[:MAX_IMAGES]
     print(f"{len(image_ids)} images to process.")
 
