@@ -24,16 +24,18 @@ Expected result:
   Individual calls give clean, correctly-labelled detections.
 """
 
-# ── CONFIG (edit these before running) ────────────────────────────────────────
-GOLD_CSV        = "/path/to/gold_bbox.csv"      # Chest ImaGenome gold annotations
-IMAGE_DIR       = "/path/to/mimic_cxr_images"   # root folder with DICOM or JPG/PNG
-OUTPUT_DIR      = "./outputs/grounding_dino"    # where results are saved
-MAX_IMAGES      = None                          # set to e.g. 10 for a quick test run
-BOX_THRESHOLD   = 0.25                          # Grounding DINO score threshold
-TEXT_THRESHOLD  = 0.20
+import os
+
+# ── CONFIG (edit these, or override via environment variables of the same name)
+GOLD_CSV        = os.environ.get("GOLD_CSV", "/path/to/gold_bbox.csv")
+IMAGE_DIR       = os.environ.get("IMAGE_DIR", "/path/to/mimic_cxr_images")
+OUTPUT_DIR      = os.environ.get("OUTPUT_DIR", "./outputs/grounding_dino")
+_max_images_env = os.environ.get("MAX_IMAGES")
+MAX_IMAGES      = int(_max_images_env) if _max_images_env else None
+BOX_THRESHOLD   = float(os.environ.get("BOX_THRESHOLD", 0.25))
+TEXT_THRESHOLD  = float(os.environ.get("TEXT_THRESHOLD", 0.20))
 # ──────────────────────────────────────────────────────────────────────────────
 
-import os
 import json
 import warnings
 warnings.filterwarnings("ignore")
@@ -50,6 +52,8 @@ from PIL import Image
 import torch
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 from transformers import SamModel, SamProcessor
+
+from cxr_common import load_image, find_image_file, box_iou
 
 # ── 15 TARGET REGIONS ─────────────────────────────────────────────────────────
 REGIONS = [
@@ -158,48 +162,6 @@ def get_medsam_mask(pil_image, box_xyxy):
         inputs["reshaped_input_sizes"].cpu(),
     )
     return masks[0].squeeze().numpy().astype(bool)
-
-# ── IoU ───────────────────────────────────────────────────────────────────────
-
-def box_iou(pred, gold):
-    ix1 = max(pred[0], gold[0])
-    iy1 = max(pred[1], gold[1])
-    ix2 = min(pred[2], gold[2])
-    iy2 = min(pred[3], gold[3])
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    if inter == 0:
-        return 0.0
-    area_pred = (pred[2] - pred[0]) * (pred[3] - pred[1])
-    area_gold = (gold[2] - gold[0]) * (gold[3] - gold[1])
-    return inter / (area_pred + area_gold - inter)
-
-# ── IMAGE LOADING ─────────────────────────────────────────────────────────────
-
-def load_image(path):
-    path = str(path)
-    if path.lower().endswith((".dcm", ".dicom")):
-        try:
-            import pydicom
-        except ImportError:
-            raise ImportError("pip install pydicom")
-        ds = pydicom.dcmread(path)
-        arr = ds.pixel_array.astype(float)
-        if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
-            arr = arr.max() - arr
-        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8) * 255
-        return Image.fromarray(arr.astype(np.uint8)).convert("RGB")
-    return Image.open(path).convert("RGB")
-
-def find_image_file(image_dir, image_id):
-    image_dir = Path(image_dir)
-    for ext in [".jpg", ".jpeg", ".png", ".dcm", ".dicom"]:
-        p = image_dir / f"{image_id}{ext}"
-        if p.exists():
-            return p
-        matches = list(image_dir.rglob(f"{image_id}{ext}"))
-        if matches:
-            return matches[0]
-    return None
 
 # ── PER-REGION VISUALIZATION ──────────────────────────────────────────────────
 

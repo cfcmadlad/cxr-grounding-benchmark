@@ -15,22 +15,30 @@ Notes on CheXagent phrase grounding:
     on MS-CXR, but those results are for pathology phrases, not anatomy names.
     Expect lower scores on normal anatomical region grounding (same caveat as
     MAIRA-2).
-  - Box output format is parsed from free-text response. The script always
-    prints the raw response for the first image so you can verify the format
-    and adjust the regex in parse_box_from_response() if needed.
+  - Box output format is parsed from free-text response using the shared
+    parse_box_from_response() in cxr_common.py. CheXagent's grounding output
+    uses "<|box|> (x1,y1),(x2,y2) <|/box|>" tags with coordinates on a 0-100
+    scale (confirmed against the RadVLM authors' own evaluation harness,
+    which parses CheXagent output with this exact tag pattern before
+    dividing by 100) -- this is checked first, with bracket/paren/bare
+    4-number formats as a fallback for other checkpoint variants.
+    PRINT_RAW_RESPONSES=True always prints the raw response for the first
+    image so you can verify the format your specific checkpoint produces.
   - Inference format verified from the official HF model card:
     processor(images=images, text=" USER: <s>{prompt} ASSISTANT: <s>")
 """
 
-# ── CONFIG (edit these before running) ────────────────────────────────────────
-GOLD_CSV    = "/path/to/gold_bbox.csv"      # Chest ImaGenome gold annotations
-IMAGE_DIR   = "/path/to/mimic_cxr_images"   # root folder with DICOM or JPG/PNG
-OUTPUT_DIR  = "./outputs/chexagent"         # where results are saved
-MAX_IMAGES  = None                          # set to e.g. 10 for a quick test run
-PRINT_RAW_RESPONSES = True                  # print raw model output (useful for debugging)
+import os
+
+# ── CONFIG (edit these, or override via environment variables of the same name)
+GOLD_CSV        = os.environ.get("GOLD_CSV", "/path/to/gold_bbox.csv")
+IMAGE_DIR       = os.environ.get("IMAGE_DIR", "/path/to/mimic_cxr_images")
+OUTPUT_DIR      = os.environ.get("OUTPUT_DIR", "./outputs/chexagent")
+_max_images_env = os.environ.get("MAX_IMAGES")
+MAX_IMAGES      = int(_max_images_env) if _max_images_env else None
+PRINT_RAW_RESPONSES = os.environ.get("PRINT_RAW_RESPONSES", "1") not in ("0", "false", "False")
 # ──────────────────────────────────────────────────────────────────────────────
 
-import os
 import re
 import json
 import warnings
@@ -48,6 +56,8 @@ from PIL import Image
 import torch
 from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig
 from transformers import SamModel, SamProcessor
+
+from cxr_common import load_image, find_image_file, box_iou, parse_box_from_response
 
 # ── 15 TARGET REGIONS ─────────────────────────────────────────────────────────
 REGIONS = [
@@ -149,35 +159,13 @@ def chexagent_ground_phrase(pil_image, phrase, print_raw=False):
     box = parse_box_from_response(response, W, H)
     return box, response
 
-def parse_box_from_response(response, img_w, img_h):
-    """
-    Extract [x1, y1, x2, y2] from free-text model response.
-    Tries multiple formats; prints a note if parsing fails so you can
-    inspect the raw response and adjust accordingly.
-    """
-    patterns = [
-        # [x1, y1, x2, y2]
-        r"\[([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)\]",
-        # (x1, y1, x2, y2)
-        r"\(([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)\)",
-        # bare: x1, y1, x2, y2
-        r"([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, response)
-        if match:
-            vals = [float(match.group(i)) for i in range(1, 5)]
-            # If values look normalized (all ≤ 1.0), scale to pixels
-            if all(v <= 1.0 for v in vals):
-                x1 = int(vals[0] * img_w)
-                y1 = int(vals[1] * img_h)
-                x2 = int(vals[2] * img_w)
-                y2 = int(vals[3] * img_h)
-            else:
-                x1, y1, x2, y2 = [int(v) for v in vals]
-            if x2 > x1 and y2 > y1:
-                return [x1, y1, x2, y2]
-    return None
+# parse_box_from_response() is imported from cxr_common. CheXagent-8b's
+# real grounding output uses "<|box|> (x1,y1),(x2,y2) <|/box|>" tags with
+# coordinates on a 0-100 scale, which the shared parser checks first,
+# falling back to bracket/paren/bare-number formats for robustness.
+# PRINT_RAW_RESPONSES=True on the first image lets you confirm the actual
+# format your checkpoint produces and add a pattern to cxr_common.py if
+# it differs.
 
 # ── MEDSAM SEGMENTATION ───────────────────────────────────────────────────────
 
@@ -193,48 +181,6 @@ def get_medsam_mask(pil_image, box_xyxy):
         inputs["reshaped_input_sizes"].cpu(),
     )
     return masks[0].squeeze().numpy().astype(bool)
-
-# ── IoU ───────────────────────────────────────────────────────────────────────
-
-def box_iou(pred, gold):
-    ix1 = max(pred[0], gold[0])
-    iy1 = max(pred[1], gold[1])
-    ix2 = min(pred[2], gold[2])
-    iy2 = min(pred[3], gold[3])
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    if inter == 0:
-        return 0.0
-    area_pred = (pred[2] - pred[0]) * (pred[3] - pred[1])
-    area_gold = (gold[2] - gold[0]) * (gold[3] - gold[1])
-    return inter / (area_pred + area_gold - inter)
-
-# ── IMAGE LOADING ─────────────────────────────────────────────────────────────
-
-def load_image(path):
-    path = str(path)
-    if path.lower().endswith((".dcm", ".dicom")):
-        try:
-            import pydicom
-        except ImportError:
-            raise ImportError("pip install pydicom")
-        ds = pydicom.dcmread(path)
-        arr = ds.pixel_array.astype(float)
-        if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
-            arr = arr.max() - arr
-        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8) * 255
-        return Image.fromarray(arr.astype(np.uint8)).convert("RGB")
-    return Image.open(path).convert("RGB")
-
-def find_image_file(image_dir, image_id):
-    image_dir = Path(image_dir)
-    for ext in [".jpg", ".jpeg", ".png", ".dcm", ".dicom"]:
-        p = image_dir / f"{image_id}{ext}"
-        if p.exists():
-            return p
-        matches = list(image_dir.rglob(f"{image_id}{ext}"))
-        if matches:
-            return matches[0]
-    return None
 
 # ── PER-REGION VISUALIZATION ──────────────────────────────────────────────────
 

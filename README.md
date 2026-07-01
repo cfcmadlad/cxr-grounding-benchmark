@@ -122,7 +122,7 @@ conda create -n biomedparse python=3.9.19 -y && conda activate biomedparse
 conda install pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvidia -y
 pip install -r assets/requirements/requirements.txt
 pip install -r requirements_biomedparse.txt   # place this file inside BiomedParse/
-# place biomedparse_seg.py inside BiomedParse/, edit config at top, then:
+# copy biomedparse_seg.py AND cxr_common.py inside BiomedParse/, edit config at top, then:
 python biomedparse_seg.py
 ```
 
@@ -156,7 +156,7 @@ Results saved to `outputs/evaluation/`:
 
 | Script | Env | Python | transformers |
 |---|---|---|---|
-| `grounding_dino_medsam.py` | `gdino` | 3.10 | >=4.38 |
+| `grounding_dino_medsam.py` | `gdino` | 3.10 | >=4.40 |
 | `biovilt_medsam.py` | `biovilt` | 3.10 | >=4.30,<4.40 |
 | `radvlm_medsam.py` | `radvlm` | 3.10 | ==4.46.0 |
 | `maira2_medsam.py` | `maira2` | 3.10 | >=4.48,<4.52 |

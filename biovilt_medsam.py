@@ -7,15 +7,17 @@ on the Chest ImaGenome gold subset.
 Requirements: see requirements_biovilt.txt
 """
 
-# ── CONFIG (edit these before running) ────────────────────────────────────────
-GOLD_CSV    = "/path/to/gold_bbox.csv"      # Chest ImaGenome gold annotations
-IMAGE_DIR   = "/path/to/mimic_cxr_images"   # root folder with DICOM or JPG/PNG
-OUTPUT_DIR  = "./outputs/biovilt"           # where results are saved
-MAX_IMAGES  = None                          # set to e.g. 10 for a quick test run
-PERCENTILE  = 90                            # heatmap threshold (90 = top 10% of similarity)
+import os
+
+# ── CONFIG (edit these, or override via environment variables of the same name)
+GOLD_CSV        = os.environ.get("GOLD_CSV", "/path/to/gold_bbox.csv")
+IMAGE_DIR       = os.environ.get("IMAGE_DIR", "/path/to/mimic_cxr_images")
+OUTPUT_DIR      = os.environ.get("OUTPUT_DIR", "./outputs/biovilt")
+_max_images_env = os.environ.get("MAX_IMAGES")
+MAX_IMAGES      = int(_max_images_env) if _max_images_env else None
+PERCENTILE      = int(os.environ.get("PERCENTILE", 90))
 # ──────────────────────────────────────────────────────────────────────────────
 
-import os
 import json
 import warnings
 warnings.filterwarnings("ignore")
@@ -32,6 +34,8 @@ from scipy import ndimage
 
 import torch
 from transformers import SamModel, SamProcessor
+
+from cxr_common import load_image, find_image_file, box_iou, mask_dice
 
 # ── 15 TARGET REGIONS ─────────────────────────────────────────────────────────
 REGIONS = [
@@ -90,10 +94,35 @@ image_text_inference = ImageTextInferenceEngine(
 )
 image_text_inference.to(DEVICE)
 
-# Compatibility patch: batch_encode_plus removed in transformers >= 4.40
-def _batch_encode_plus_shim(batch_text_or_text_pairs, **kwargs):
-    return text_inference.tokenizer(batch_text_or_text_pairs, **kwargs)
-text_inference.tokenizer.batch_encode_plus = _batch_encode_plus_shim
+# Compatibility patch: `batch_encode_plus` was deprecated for years and
+# was finally removed from PreTrainedTokenizerBase in transformers v5.0.0
+# (Jan 2026) as part of the v5 API cleanup -- NOT in 4.40 as sometimes
+# assumed. requirements_biovilt.txt pins transformers<4.40 which keeps
+# batch_encode_plus available, but this shim is kept as a safety net in
+# case a transitive dependency ever pulls in transformers>=5 despite the
+# pin. hi-ml-multimodal's BertEncoder still calls
+# tokenizer.batch_encode_plus directly and was archived on GitHub
+# (Nov 21, 2025), so it will never be updated to use __call__ instead.
+#
+# Patched at both the instance level (covers the tokenizer object already
+# constructed above) and the class level (covers any tokenizer object
+# hi-ml-multimodal constructs internally later, e.g. during .to(device)
+# or lazy re-initialization), since which object's method is actually
+# called is an internal implementation detail of hi-ml-multimodal.
+def _batch_encode_plus_shim(self, batch_text_or_text_pairs, **kwargs):
+    return self(batch_text_or_text_pairs, **kwargs)
+
+if not hasattr(text_inference.tokenizer, "batch_encode_plus"):
+    text_inference.tokenizer.batch_encode_plus = (
+        lambda batch_text_or_text_pairs, **kwargs: text_inference.tokenizer(
+            batch_text_or_text_pairs, **kwargs
+        )
+    )
+
+from transformers import PreTrainedTokenizerBase
+if not hasattr(PreTrainedTokenizerBase, "batch_encode_plus"):
+    PreTrainedTokenizerBase.batch_encode_plus = _batch_encode_plus_shim
+
 print("BioViL-T loaded.")
 
 print("Loading MedSAM...")
@@ -141,54 +170,6 @@ def get_medsam_mask(pil_image, box_xyxy):
         inputs["reshaped_input_sizes"].cpu(),
     )
     return masks[0].squeeze().numpy().astype(bool)
-
-# ── IoU / DICE ────────────────────────────────────────────────────────────────
-
-def box_iou(pred, gold):
-    ix1 = max(pred[0], gold[0])
-    iy1 = max(pred[1], gold[1])
-    ix2 = min(pred[2], gold[2])
-    iy2 = min(pred[3], gold[3])
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    if inter == 0:
-        return 0.0
-    area_pred = (pred[2] - pred[0]) * (pred[3] - pred[1])
-    area_gold = (gold[2] - gold[0]) * (gold[3] - gold[1])
-    return inter / (area_pred + area_gold - inter)
-
-def mask_dice(pred_mask, gold_mask):
-    intersection = (pred_mask & gold_mask).sum()
-    if intersection == 0:
-        return 0.0
-    return 2 * intersection / (pred_mask.sum() + gold_mask.sum())
-
-# ── IMAGE LOADING ─────────────────────────────────────────────────────────────
-
-def load_image(path):
-    path = str(path)
-    if path.lower().endswith((".dcm", ".dicom")):
-        try:
-            import pydicom
-        except ImportError:
-            raise ImportError("pip install pydicom")
-        ds  = pydicom.dcmread(path)
-        arr = ds.pixel_array.astype(float)
-        if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
-            arr = arr.max() - arr
-        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8) * 255
-        return Image.fromarray(arr.astype(np.uint8)).convert("RGB")
-    return Image.open(path).convert("RGB")
-
-def find_image_file(image_dir, image_id):
-    image_dir = Path(image_dir)
-    for ext in [".jpg", ".jpeg", ".png", ".dcm", ".dicom"]:
-        p = image_dir / f"{image_id}{ext}"
-        if p.exists():
-            return p
-        matches = list(image_dir.rglob(f"{image_id}{ext}"))
-        if matches:
-            return matches[0]
-    return None
 
 # ── PER-REGION VISUALIZATION ──────────────────────────────────────────────────
 
@@ -351,7 +332,9 @@ def main():
             if pred_box and gold_box:
                 iou = box_iou(pred_box, gold_box)
 
-            print(f"  {region}: IoU={iou:.3f if iou is not None else 'N/A'}  peak_sim={peak_score:.3f if peak_score is not None else 'N/A'}")
+            iou_str = f"{iou:.3f}" if iou is not None else "N/A"
+            sim_str = f"{peak_score:.3f}" if peak_score is not None else "N/A"
+            print(f"  {region}: IoU={iou_str}  peak_sim={sim_str}")
 
             save_region_png(
                 pil_img, region, pred_box, gold_box, mask,

@@ -37,3 +37,9 @@
 pydicom>=2.4.0
 pandas>=2.0.0
 matplotlib>=3.7.0
+
+# BiomedParse's own assets/requirements/requirements.txt (installed in Step 4)
+# predates NumPy 2.0 and pins an old detectron2/opencv-python stack under
+# Python 3.9.19. If assets/requirements/requirements.txt does not already
+# pin numpy itself, cap it here to avoid dtype/ABI breakage:
+numpy<2.0.0
