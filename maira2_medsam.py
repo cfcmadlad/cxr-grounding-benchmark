@@ -11,31 +11,44 @@ IMPORTANT — Gated model access:
   weights can be downloaded. Go to https://huggingface.co/microsoft/maira-2
   and click "Agree and access repository". Then log in from the terminal:
       huggingface-cli login
-  Paste your HF token when prompted. This only needs to be done once.
+
+All paths are read from config.yaml at the repo root — nothing is hardcoded.
 
 Notes on MAIRA-2's phrase grounding:
   - Designed to ground pathology findings (e.g. "pleural effusion"), not
     normal anatomy. Anatomical grounding is not its primary use case, so
     mAP will likely be lower than RadVLM's 85.3% on this task.
-  - Box coordinates are output relative to MAIRA-2's internally cropped
-    image (518x518). processor.adjust_box_for_original_image_size() is
-    required to convert back to original image pixel coordinates.
+  - Box coordinates are output NORMALIZED and relative to MAIRA-2's internally
+    cropped 518x518 view. Mapping them back to original pixels is NOT a plain
+    W/518, H/518 scale: MAIRA-2 pads the image to a square and centre-crops
+    before resizing to 518, so the inverse must also undo that pad/crop offset.
+    processor.adjust_box_for_original_image_size() performs exactly this
+    crop-aware inverse (returns pixel (x1, y1, x2, y2) in the original image),
+    which is why we use it rather than reimplementing a naive scale.
   - transformers>=4.48.0,<4.52 is required (tested up to 4.51.3 per model card).
-    This conflicts with RadVLM (==4.46.0) and BioViL-T (<4.40.0) — use a
-    separate conda env (maira2).
 """
 
-# ── CONFIG (edit these before running) ────────────────────────────────────────
-GOLD_CSV    = "/path/to/gold_bbox.csv"      # Chest ImaGenome gold annotations
-IMAGE_DIR   = "/path/to/mimic_cxr_images"   # root folder with DICOM or JPG/PNG
-OUTPUT_DIR  = "./outputs/maira2"            # where results are saved
-MAX_IMAGES  = None                          # set to e.g. 10 for a quick test run
-# ──────────────────────────────────────────────────────────────────────────────
-
 import os
+import sys
 import json
 import warnings
 warnings.filterwarnings("ignore")
+
+# ── CONFIG + HF cache (must precede heavy imports) ────────────────────────────
+from cxr_common import (
+    load_config, setup_hf_home, load_image, find_image_file,
+    load_gold_annotations, validate_box, clamp_box, compute_iou,
+    result_row, write_result_row, init_results_csv, BOX_FIELDS, get_logger,
+)
+
+log = get_logger("maira2")
+cfg = load_config(required_keys=["GOLD_CSV", "IMAGE_DIR", "OUTPUT_DIR"])
+setup_hf_home(cfg)
+
+GOLD_CSV   = cfg["GOLD_CSV"]
+IMAGE_DIR  = cfg["IMAGE_DIR"]
+OUTPUT_DIR = os.path.join(cfg["OUTPUT_DIR"], "maira2")
+MAX_IMAGES = cfg.get("MAX_IMAGES")
 
 import numpy as np
 import pandas as pd
@@ -44,7 +57,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from pathlib import Path
-from PIL import Image
 
 import torch
 from transformers import AutoModelForCausalLM, AutoProcessor
@@ -116,11 +128,11 @@ print("MedSAM loaded.")
 def maira_ground_phrase(pil_image, phrase):
     """
     Run MAIRA-2 phrase grounding for a single phrase on a single image.
-    Returns pixel-coordinate box [x1, y1, x2, y2] or None if not detected.
+    Returns (pixel-coordinate box [x1, y1, x2, y2] or None, raw decoded text).
 
-    Box coordinates from MAIRA-2 are normalized and relative to the
-    internally cropped image. processor.adjust_box_for_original_image_size
-    converts them back to original image pixel coordinates.
+    MAIRA-2 emits normalized coords relative to its cropped 518x518 view;
+    adjust_box_for_original_image_size() maps them back to original pixels
+    (accounting for the pad/centre-crop, not just a linear W/518, H/518 scale).
     """
     processed_inputs = maira_processor.format_and_preprocess_phrase_grounding_input(
         frontal_image=pil_image,
@@ -143,8 +155,7 @@ def maira_ground_phrase(pil_image, phrase):
 
     prediction = maira_processor.convert_output_to_plaintext_or_grounded_sequence(decoded_text)
 
-    # prediction is a list of (text, boxes_or_None) tuples
-    # For phrase grounding it's typically one tuple: ('phrase text.', [(x1,y1,x2,y2)])
+    # prediction is a list of (text, boxes_or_None) tuples.
     if not prediction:
         return None, decoded_text
 
@@ -152,19 +163,24 @@ def maira_ground_phrase(pil_image, phrase):
     if not boxes:
         return None, decoded_text
 
-    # Take the first (usually only) box and adjust for original image size
+    # Take the first (usually only) box and adjust for original image size.
     raw_box = boxes[0]  # normalized coords relative to MAIRA-2's cropped view
     adjusted = maira_processor.adjust_box_for_original_image_size(
         box=raw_box,
         original_image=pil_image,
     )
-    # adjusted is (x1, y1, x2, y2) in pixel coords of the original image
+    # adjusted is (x1, y1, x2, y2) in pixel coords of the original image.
     x1, y1, x2, y2 = adjusted
     return [int(x1), int(y1), int(x2), int(y2)], decoded_text
 
 # ── MEDSAM SEGMENTATION ───────────────────────────────────────────────────────
 
 def get_medsam_mask(pil_image, box_xyxy):
+    """Segment inside box_xyxy (pixel x1y1x2y2 at original resolution).
+
+    SamProcessor resizes to 1024x1024 and rescales the box; the mask is resized
+    back to original dimensions by post_process_masks(original_sizes=...).
+    """
     inputs = medsam_processor(
         pil_image, input_boxes=[[box_xyxy]], return_tensors="pt"
     ).to(DEVICE)
@@ -176,48 +192,6 @@ def get_medsam_mask(pil_image, box_xyxy):
         inputs["reshaped_input_sizes"].cpu(),
     )
     return masks[0].squeeze().numpy().astype(bool)
-
-# ── IoU / DICE ────────────────────────────────────────────────────────────────
-
-def box_iou(pred, gold):
-    ix1 = max(pred[0], gold[0])
-    iy1 = max(pred[1], gold[1])
-    ix2 = min(pred[2], gold[2])
-    iy2 = min(pred[3], gold[3])
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    if inter == 0:
-        return 0.0
-    area_pred = (pred[2] - pred[0]) * (pred[3] - pred[1])
-    area_gold = (gold[2] - gold[0]) * (gold[3] - gold[1])
-    return inter / (area_pred + area_gold - inter)
-
-# ── IMAGE LOADING ─────────────────────────────────────────────────────────────
-
-def load_image(path):
-    path = str(path)
-    if path.lower().endswith((".dcm", ".dicom")):
-        try:
-            import pydicom
-        except ImportError:
-            raise ImportError("pip install pydicom")
-        ds = pydicom.dcmread(path)
-        arr = ds.pixel_array.astype(float)
-        if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
-            arr = arr.max() - arr
-        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8) * 255
-        return Image.fromarray(arr.astype(np.uint8)).convert("RGB")
-    return Image.open(path).convert("RGB")
-
-def find_image_file(image_dir, image_id):
-    image_dir = Path(image_dir)
-    for ext in [".jpg", ".jpeg", ".png", ".dcm", ".dicom"]:
-        p = image_dir / f"{image_id}{ext}"
-        if p.exists():
-            return p
-        matches = list(image_dir.rglob(f"{image_id}{ext}"))
-        if matches:
-            return matches[0]
-    return None
 
 # ── PER-REGION VISUALIZATION ──────────────────────────────────────────────────
 
@@ -290,32 +264,12 @@ def save_region_png(pil_image, region, pred_box, gold_box, mask, iou, image_id, 
     plt.close()
     return out_path
 
-# ── GOLD ANNOTATION LOADER ────────────────────────────────────────────────────
-
-def load_gold_annotations(csv_path):
-    df = pd.read_csv(csv_path)
-    required = {"image_id", "bbox_name", "x", "y", "w", "h"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(
-            f"Gold CSV is missing columns: {missing}\n"
-            f"Found columns: {list(df.columns)}\n"
-            "Please update REGION_TO_BBOX_NAME and column names in load_gold_annotations()."
-        )
-    gold = {}
-    for _, row in df.iterrows():
-        iid  = str(row["image_id"])
-        name = str(row["bbox_name"]).lower().strip()
-        box  = [int(row["x"]), int(row["y"]),
-                int(row["x"]) + int(row["w"]),
-                int(row["y"]) + int(row["h"])]
-        gold.setdefault(iid, {})[name] = box
-    return gold
-
 # ── MAIN LOOP ─────────────────────────────────────────────────────────────────
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    summary_path = str(Path(OUTPUT_DIR) / "results_summary.csv")
+    init_results_csv(summary_path)
 
     print(f"\nLoading gold annotations from {GOLD_CSV}...")
     gold_annotations = load_gold_annotations(GOLD_CSV)
@@ -325,104 +279,126 @@ def main():
     print(f"{len(image_ids)} images to process.")
 
     all_results = []
+    images_processed = 0
+    regions_done = 0
+    failed_count = 0
 
     for img_idx, image_id in enumerate(image_ids):
         print(f"\n[{img_idx+1}/{len(image_ids)}] {image_id}")
 
         img_path = find_image_file(IMAGE_DIR, image_id)
         if img_path is None:
-            print(f"  Image file not found, skipping.")
+            log.error("image_id=%s: image file not found, skipping.", image_id)
+            failed_count += 1
             continue
 
-        try:
-            pil_img = load_image(img_path)
-        except Exception as e:
-            print(f"  Failed to load image: {e}, skipping.")
+        pil_img = load_image(img_path)
+        if pil_img is None:
+            log.error("image_id=%s: load_image returned None, skipping.", image_id)
+            failed_count += 1
             continue
 
+        images_processed += 1
+        W, H = pil_img.size
         per_image_boxes = {}
         per_image_masks = {}
 
         for region in REGIONS:
+            bbox_name = REGION_TO_BBOX_NAME.get(region, region).lower()
+            gold_box = gold_annotations[image_id].get(bbox_name)
+
             pred_box = None
-            mask     = None
+            mask = None
+            iou = None
             raw_resp = ""
 
             try:
                 pred_box, raw_resp = maira_ground_phrase(pil_img, region)
-            except Exception as e:
-                print(f"  {region}: MAIRA-2 error: {e}")
 
-            per_image_boxes[region] = {
-                "pred_box":     pred_box,
-                "raw_response": raw_resp,
-            }
+                # Clamp mapped-back box to image bounds and validate before MedSAM.
+                if pred_box is not None:
+                    pred_box = clamp_box(pred_box, W, H)
+                    if not validate_box(pred_box, W, H):
+                        pred_box = None
 
-            if pred_box is not None:
+                if pred_box is not None:
+                    try:
+                        mask = get_medsam_mask(pil_img, pred_box)
+                    except Exception:
+                        log.exception("image_id=%s region=%s: MedSAM failed",
+                                      image_id, region)
+                        mask = None
+                    iou = compute_iou(pred_box, gold_box)
+
+                detected = pred_box is not None
+                write_result_row(
+                    summary_path,
+                    result_row(image_id, region, iou, detected, gold_box, pred_box),
+                    BOX_FIELDS,
+                )
+                regions_done += 1
+
+                per_image_boxes[region] = {
+                    "pred_box": pred_box, "raw_response": raw_resp
+                }
+                per_image_masks[region] = mask
+                all_results.append({
+                    "image_id": image_id, "region": region,
+                    "iou": iou, "detected": detected,
+                })
+
+                print(f"  {region}: IoU={f'{iou:.3f}' if iou is not None else 'N/A'}"
+                      f"  pred={pred_box}")
+
                 try:
-                    mask = get_medsam_mask(pil_img, pred_box)
-                except Exception as e:
-                    print(f"  {region}: MedSAM error: {e}")
-            per_image_masks[region] = mask
+                    save_region_png(pil_img, region, pred_box, gold_box, mask,
+                                    iou, image_id, out_dir=OUTPUT_DIR)
+                except Exception:
+                    log.exception("image_id=%s region=%s: visualization failed",
+                                  image_id, region)
 
-            bbox_name = REGION_TO_BBOX_NAME.get(region, region).lower()
-            gold_box  = gold_annotations[image_id].get(bbox_name)
+            except Exception:
+                failed_count += 1
+                log.exception("image_id=%s region=%s: inference block failed",
+                              image_id, region)
+                write_result_row(
+                    summary_path,
+                    result_row(image_id, region, None, False, gold_box, None),
+                    BOX_FIELDS,
+                )
+                continue
 
-            iou = None
-            if pred_box and gold_box:
-                iou = box_iou(pred_box, gold_box)
-
-            print(f"  {region}: IoU={f'{iou:.3f}' if iou is not None else 'N/A'}  pred={pred_box}")
-
-            save_region_png(
-                pil_img, region, pred_box, gold_box, mask,
-                iou, image_id, out_dir=OUTPUT_DIR
-            )
-
-            all_results.append({
-                "image_id": image_id,
-                "region":   region,
-                "pred_box": pred_box,
-                "gold_box": gold_box,
-                "iou":      iou,
-                "detected": pred_box is not None,
-            })
-
-        # Per-image JSON
-        json_out = Path(OUTPUT_DIR) / image_id / "boxes.json"
-        json_out.parent.mkdir(parents=True, exist_ok=True)
-        with open(json_out, "w") as f:
-            json.dump(per_image_boxes, f, indent=2)
-
-        # Per-image masks NPZ
-        masks_to_save = {
-            r.replace(" ", "_"): m
-            for r, m in per_image_masks.items()
-            if m is not None
-        }
-        if masks_to_save:
-            np.savez_compressed(
-                str(Path(OUTPUT_DIR) / image_id / "masks.npz"),
-                **masks_to_save
-            )
+        # Per-image JSON + masks NPZ (best-effort)
+        try:
+            json_out = Path(OUTPUT_DIR) / image_id / "boxes.json"
+            json_out.parent.mkdir(parents=True, exist_ok=True)
+            with open(json_out, "w") as f:
+                json.dump(per_image_boxes, f, indent=2)
+            masks_to_save = {
+                r.replace(" ", "_"): m
+                for r, m in per_image_masks.items() if m is not None
+            }
+            if masks_to_save:
+                np.savez_compressed(
+                    str(Path(OUTPUT_DIR) / image_id / "masks.npz"), **masks_to_save
+                )
+        except Exception:
+            log.exception("image_id=%s: failed to write per-image JSON/NPZ", image_id)
 
     # ── SUMMARY ───────────────────────────────────────────────────────────────
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("SUMMARY")
-    print("="*60)
+    print("=" * 60)
+    print(f"Incremental results written to {summary_path}")
 
-    results_df   = pd.DataFrame(all_results)
-    summary_path = Path(OUTPUT_DIR) / "results_summary.csv"
-    results_df.to_csv(summary_path, index=False)
-    print(f"Full results saved to {summary_path}")
-
+    results_df = pd.DataFrame(all_results)
     if not results_df.empty:
         region_summary = (
             results_df.groupby("region")
             .agg(
-                detected = ("detected", "sum"),
-                total    = ("image_id", "count"),
-                mean_iou = ("iou",      "mean"),
+                detected=("detected", "sum"),
+                total=("region", "count"),
+                mean_iou=("iou", "mean"),
             )
             .reset_index()
         )
@@ -437,6 +413,9 @@ def main():
         overall_det = results_df["detected"].mean() * 100
         print(f"\nOverall mean IoU:       {overall_iou:.3f}")
         print(f"Overall detection rate: {overall_det:.1f}%")
+
+    print(f"\nCompleted: {images_processed} images, {regions_done} regions, "
+          f"{failed_count} failures")
 
 if __name__ == "__main__":
     main()

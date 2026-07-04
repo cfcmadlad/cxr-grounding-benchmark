@@ -1,0 +1,27 @@
+# config.yaml — single source of truth for all paths on the Sharanga HPC run.
+# Every model script, evaluate.py and setup_check.py read from this file.
+# No paths are hardcoded in any Python script.
+#
+# Edit these values to match your cluster layout, then run setup_check.py to
+# verify everything before submitting the Slurm jobs.
+
+# Chest ImaGenome gold annotations CSV (columns: image_id, bbox_name, x, y, w, h)
+GOLD_CSV: "/home/manik/cxr-grounding-benchmark/data/gold_annotations.csv"
+
+# Root folder containing the CXR images (DICOM or PNG/JPG; searched recursively)
+IMAGE_DIR: "/home/manik/cxr-grounding-benchmark/data/images"
+
+# Folder containing the RadVLM weights downloaded from PhysioNet
+RADVLM_PATH: "/home/manik/cxr-grounding-benchmark/data/radvlm_weights"
+
+# Base output directory. Each model writes to OUTPUT_DIR/<model_name>/
+OUTPUT_DIR: "/home/manik/cxr-grounding-benchmark/outputs"
+
+# Maximum number of images to process (null = all). 500 = full gold subset.
+MAX_IMAGES: 500
+
+# HuggingFace cache location (weights are downloaded / cached here)
+HF_HOME: "/home/manik/cxr-grounding-benchmark/.cache/huggingface"
+
+# Path to the cloned BiomedParse repository (required by biomedparse_seg.py)
+BIOMEDPARSE_REPO: "/home/manik/cxr-grounding-benchmark/BiomedParse"

@@ -7,34 +7,43 @@ on the Chest ImaGenome gold subset.
 Requirements: see requirements_chexagent.txt
 
 Model: StanfordAIMI/CheXagent-8b (open weights, no gated access needed)
-Paper: CheXagent: Towards a Foundation Model for Chest X-Ray Interpretation
-       https://arxiv.org/abs/2401.12208
+Paper: https://arxiv.org/abs/2401.12208
+
+All paths are read from config.yaml at the repo root — nothing is hardcoded.
 
 Notes on CheXagent phrase grounding:
-  - CheXagent was evaluated on phrase grounding with mIoU 0.627 / mAP 0.810
-    on MS-CXR, but those results are for pathology phrases, not anatomy names.
-    Expect lower scores on normal anatomical region grounding (same caveat as
-    MAIRA-2).
-  - Box output format is parsed from free-text response. The script always
-    prints the raw response for the first image so you can verify the format
-    and adjust the regex in parse_box_from_response() if needed.
-  - Inference format verified from the official HF model card:
+  - Evaluated primarily on pathology phrases, not anatomy names — expect lower
+    scores on normal anatomical region grounding (same caveat as MAIRA-2).
+  - Box output is parsed from free text. The RAW model output for the VERY
+    FIRST image is printed to stdout so the box format can be verified on HPC
+    and parse_box_from_response() adjusted if needed.
+  - Inference format from the official HF model card:
     processor(images=images, text=" USER: <s>{prompt} ASSISTANT: <s>")
 """
 
-# ── CONFIG (edit these before running) ────────────────────────────────────────
-GOLD_CSV    = "/path/to/gold_bbox.csv"      # Chest ImaGenome gold annotations
-IMAGE_DIR   = "/path/to/mimic_cxr_images"   # root folder with DICOM or JPG/PNG
-OUTPUT_DIR  = "./outputs/chexagent"         # where results are saved
-MAX_IMAGES  = None                          # set to e.g. 10 for a quick test run
-PRINT_RAW_RESPONSES = True                  # print raw model output (useful for debugging)
-# ──────────────────────────────────────────────────────────────────────────────
-
 import os
+import sys
 import re
 import json
 import warnings
 warnings.filterwarnings("ignore")
+
+# ── CONFIG + HF cache (must precede heavy imports) ────────────────────────────
+from cxr_common import (
+    load_config, setup_hf_home, load_image, find_image_file,
+    load_gold_annotations, validate_box, clamp_box, compute_iou,
+    result_row, write_result_row, init_results_csv, BOX_FIELDS, get_logger,
+)
+
+log = get_logger("chexagent")
+cfg = load_config(required_keys=["GOLD_CSV", "IMAGE_DIR", "OUTPUT_DIR"])
+setup_hf_home(cfg)
+
+GOLD_CSV   = cfg["GOLD_CSV"]
+IMAGE_DIR  = cfg["IMAGE_DIR"]
+OUTPUT_DIR = os.path.join(cfg["OUTPUT_DIR"], "chexagent")
+MAX_IMAGES = cfg.get("MAX_IMAGES")
+PRINT_RAW_RESPONSES = True   # print raw model output on the first image
 
 import numpy as np
 import pandas as pd
@@ -43,7 +52,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from pathlib import Path
-from PIL import Image
 
 import torch
 from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig
@@ -118,10 +126,7 @@ print("MedSAM loaded.")
 def chexagent_ground_phrase(pil_image, phrase, print_raw=False):
     """
     Run CheXagent phrase grounding for a single phrase on a single image.
-    Returns pixel-coordinate box [x1, y1, x2, y2] or None if not detected.
-
-    Inference format from official HF model card:
-      processor(images=images, text=" USER: <s>{prompt} ASSISTANT: <s>")
+    Returns (pixel-coordinate box [x1, y1, x2, y2] or None, raw response text).
     """
     images = [pil_image]
     prompt = (
@@ -149,39 +154,62 @@ def chexagent_ground_phrase(pil_image, phrase, print_raw=False):
     box = parse_box_from_response(response, W, H)
     return box, response
 
+
+_NUM = r"(\d*\.?\d+)"
+_SEP = r"[\s,]+"
+
+# Several fallback patterns for CheXagent's free-text box output.
+_BOX_PATTERNS = [
+    r"\[\s*" + _NUM + _SEP + _NUM + _SEP + _NUM + _SEP + _NUM + r"\s*\]",   # [x1,y1,x2,y2]
+    r"\(\s*" + _NUM + _SEP + _NUM + _SEP + _NUM + _SEP + _NUM + r"\s*\)",   # (x1,y1,x2,y2)
+    r"<box>\s*" + _NUM + _SEP + _NUM + _SEP + _NUM + _SEP + _NUM + r"\s*</box>",
+    r"x1\s*[:=]\s*" + _NUM + r".*?y1\s*[:=]\s*" + _NUM +
+    r".*?x2\s*[:=]\s*" + _NUM + r".*?y2\s*[:=]\s*" + _NUM,
+    _NUM + _SEP + _NUM + _SEP + _NUM + _SEP + _NUM,                          # bare
+]
+
+
 def parse_box_from_response(response, img_w, img_h):
     """
-    Extract [x1, y1, x2, y2] from free-text model response.
-    Tries multiple formats; prints a note if parsing fails so you can
-    inspect the raw response and adjust accordingly.
+    Extract [x1, y1, x2, y2] pixel coordinates from CheXagent's free-text
+    response. If all four values look normalized (<= 1.0) they are scaled by the
+    image dimensions; otherwise they are treated as pixels and clamped. Tries
+    several fallback formats; returns None if nothing usable is found.
     """
-    patterns = [
-        # [x1, y1, x2, y2]
-        r"\[([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)\]",
-        # (x1, y1, x2, y2)
-        r"\(([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)\)",
-        # bare: x1, y1, x2, y2
-        r"([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)[,\s]+([0-9.]+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, response)
-        if match:
+    if not response:
+        return None
+    for pattern in _BOX_PATTERNS:
+        match = re.search(pattern, response, flags=re.DOTALL | re.IGNORECASE)
+        if not match:
+            continue
+        try:
             vals = [float(match.group(i)) for i in range(1, 5)]
-            # If values look normalized (all ≤ 1.0), scale to pixels
-            if all(v <= 1.0 for v in vals):
-                x1 = int(vals[0] * img_w)
-                y1 = int(vals[1] * img_h)
-                x2 = int(vals[2] * img_w)
-                y2 = int(vals[3] * img_h)
-            else:
-                x1, y1, x2, y2 = [int(v) for v in vals]
-            if x2 > x1 and y2 > y1:
-                return [x1, y1, x2, y2]
+        except (ValueError, IndexError):
+            continue
+        if all(0.0 <= v <= 1.0 for v in vals):
+            # Normalized -> denormalize with correct dimensions (x*w, y*h).
+            x1 = int(round(vals[0] * img_w))
+            y1 = int(round(vals[1] * img_h))
+            x2 = int(round(vals[2] * img_w))
+            y2 = int(round(vals[3] * img_h))
+        else:
+            # Pixel coordinates -> clamp into the image.
+            x1 = int(round(min(max(vals[0], 0.0), img_w)))
+            y1 = int(round(min(max(vals[1], 0.0), img_h)))
+            x2 = int(round(min(max(vals[2], 0.0), img_w)))
+            y2 = int(round(min(max(vals[3], 0.0), img_h)))
+        if x2 > x1 and y2 > y1:
+            return [x1, y1, x2, y2]
     return None
 
 # ── MEDSAM SEGMENTATION ───────────────────────────────────────────────────────
 
 def get_medsam_mask(pil_image, box_xyxy):
+    """Segment inside box_xyxy (pixel x1y1x2y2 at original resolution).
+
+    SamProcessor resizes to 1024x1024 and rescales the box; the mask is resized
+    back to original dimensions by post_process_masks(original_sizes=...).
+    """
     inputs = medsam_processor(
         pil_image, input_boxes=[[box_xyxy]], return_tensors="pt"
     ).to(DEVICE)
@@ -193,48 +221,6 @@ def get_medsam_mask(pil_image, box_xyxy):
         inputs["reshaped_input_sizes"].cpu(),
     )
     return masks[0].squeeze().numpy().astype(bool)
-
-# ── IoU ───────────────────────────────────────────────────────────────────────
-
-def box_iou(pred, gold):
-    ix1 = max(pred[0], gold[0])
-    iy1 = max(pred[1], gold[1])
-    ix2 = min(pred[2], gold[2])
-    iy2 = min(pred[3], gold[3])
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    if inter == 0:
-        return 0.0
-    area_pred = (pred[2] - pred[0]) * (pred[3] - pred[1])
-    area_gold = (gold[2] - gold[0]) * (gold[3] - gold[1])
-    return inter / (area_pred + area_gold - inter)
-
-# ── IMAGE LOADING ─────────────────────────────────────────────────────────────
-
-def load_image(path):
-    path = str(path)
-    if path.lower().endswith((".dcm", ".dicom")):
-        try:
-            import pydicom
-        except ImportError:
-            raise ImportError("pip install pydicom")
-        ds = pydicom.dcmread(path)
-        arr = ds.pixel_array.astype(float)
-        if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
-            arr = arr.max() - arr
-        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8) * 255
-        return Image.fromarray(arr.astype(np.uint8)).convert("RGB")
-    return Image.open(path).convert("RGB")
-
-def find_image_file(image_dir, image_id):
-    image_dir = Path(image_dir)
-    for ext in [".jpg", ".jpeg", ".png", ".dcm", ".dicom"]:
-        p = image_dir / f"{image_id}{ext}"
-        if p.exists():
-            return p
-        matches = list(image_dir.rglob(f"{image_id}{ext}"))
-        if matches:
-            return matches[0]
-    return None
 
 # ── PER-REGION VISUALIZATION ──────────────────────────────────────────────────
 
@@ -306,32 +292,12 @@ def save_region_png(pil_image, region, pred_box, gold_box, mask, iou, image_id, 
     plt.close()
     return out_path
 
-# ── GOLD ANNOTATION LOADER ────────────────────────────────────────────────────
-
-def load_gold_annotations(csv_path):
-    df = pd.read_csv(csv_path)
-    required = {"image_id", "bbox_name", "x", "y", "w", "h"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(
-            f"Gold CSV is missing columns: {missing}\n"
-            f"Found columns: {list(df.columns)}\n"
-            "Please update REGION_TO_BBOX_NAME and column names in load_gold_annotations()."
-        )
-    gold = {}
-    for _, row in df.iterrows():
-        iid  = str(row["image_id"])
-        name = str(row["bbox_name"]).lower().strip()
-        box  = [int(row["x"]), int(row["y"]),
-                int(row["x"]) + int(row["w"]),
-                int(row["y"]) + int(row["h"])]
-        gold.setdefault(iid, {})[name] = box
-    return gold
-
 # ── MAIN LOOP ─────────────────────────────────────────────────────────────────
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    summary_path = str(Path(OUTPUT_DIR) / "results_summary.csv")
+    init_results_csv(summary_path)
 
     print(f"\nLoading gold annotations from {GOLD_CSV}...")
     gold_annotations = load_gold_annotations(GOLD_CSV)
@@ -341,6 +307,9 @@ def main():
     print(f"{len(image_ids)} images to process.")
 
     all_results = []
+    images_processed = 0
+    regions_done = 0
+    failed_count = 0
     first_image = True
 
     for img_idx, image_id in enumerate(image_ids):
@@ -348,105 +317,124 @@ def main():
 
         img_path = find_image_file(IMAGE_DIR, image_id)
         if img_path is None:
-            print(f"  Image file not found, skipping.")
+            log.error("image_id=%s: image file not found, skipping.", image_id)
+            failed_count += 1
             continue
 
-        try:
-            pil_img = load_image(img_path)
-        except Exception as e:
-            print(f"  Failed to load image: {e}, skipping.")
+        pil_img = load_image(img_path)
+        if pil_img is None:
+            log.error("image_id=%s: load_image returned None, skipping.", image_id)
+            failed_count += 1
             continue
 
+        images_processed += 1
+        W, H = pil_img.size
         per_image_boxes = {}
         per_image_masks = {}
 
         for region in REGIONS:
+            bbox_name = REGION_TO_BBOX_NAME.get(region, region).lower()
+            gold_box = gold_annotations[image_id].get(bbox_name)
+
             pred_box = None
-            mask     = None
+            mask = None
+            iou = None
             raw_resp = ""
 
-            # Print raw responses for the first image only (for format inspection)
+            # Print raw responses for the first image only (format inspection).
             print_raw = PRINT_RAW_RESPONSES and first_image
 
             try:
                 pred_box, raw_resp = chexagent_ground_phrase(
                     pil_img, region, print_raw=print_raw
                 )
-            except Exception as e:
-                print(f"  {region}: CheXagent error: {e}")
 
-            per_image_boxes[region] = {
-                "pred_box":     pred_box,
-                "raw_response": raw_resp[:200],  # truncated for JSON
-            }
+                # Clamp + validate before MedSAM.
+                if pred_box is not None:
+                    pred_box = clamp_box(pred_box, W, H)
+                    if not validate_box(pred_box, W, H):
+                        pred_box = None
 
-            if pred_box is not None:
+                if pred_box is not None:
+                    try:
+                        mask = get_medsam_mask(pil_img, pred_box)
+                    except Exception:
+                        log.exception("image_id=%s region=%s: MedSAM failed",
+                                      image_id, region)
+                        mask = None
+                    iou = compute_iou(pred_box, gold_box)
+
+                detected = pred_box is not None
+                write_result_row(
+                    summary_path,
+                    result_row(image_id, region, iou, detected, gold_box, pred_box),
+                    BOX_FIELDS,
+                )
+                regions_done += 1
+
+                per_image_boxes[region] = {
+                    "pred_box": pred_box, "raw_response": raw_resp[:200]
+                }
+                per_image_masks[region] = mask
+                all_results.append({
+                    "image_id": image_id, "region": region,
+                    "iou": iou, "detected": detected,
+                })
+
+                print(f"  {region}: IoU={f'{iou:.3f}' if iou is not None else 'N/A'}"
+                      f"  pred={pred_box}")
+
                 try:
-                    mask = get_medsam_mask(pil_img, pred_box)
-                except Exception as e:
-                    print(f"  {region}: MedSAM error: {e}")
-            per_image_masks[region] = mask
+                    save_region_png(pil_img, region, pred_box, gold_box, mask,
+                                    iou, image_id, out_dir=OUTPUT_DIR)
+                except Exception:
+                    log.exception("image_id=%s region=%s: visualization failed",
+                                  image_id, region)
 
-            bbox_name = REGION_TO_BBOX_NAME.get(region, region).lower()
-            gold_box  = gold_annotations[image_id].get(bbox_name)
-
-            iou = None
-            if pred_box and gold_box:
-                iou = box_iou(pred_box, gold_box)
-
-            print(f"  {region}: IoU={f'{iou:.3f}' if iou is not None else 'N/A'}  pred={pred_box}")
-
-            save_region_png(
-                pil_img, region, pred_box, gold_box, mask,
-                iou, image_id, out_dir=OUTPUT_DIR
-            )
-
-            all_results.append({
-                "image_id": image_id,
-                "region":   region,
-                "pred_box": pred_box,
-                "gold_box": gold_box,
-                "iou":      iou,
-                "detected": pred_box is not None,
-            })
+            except Exception:
+                failed_count += 1
+                log.exception("image_id=%s region=%s: inference block failed",
+                              image_id, region)
+                write_result_row(
+                    summary_path,
+                    result_row(image_id, region, None, False, gold_box, None),
+                    BOX_FIELDS,
+                )
+                continue
 
         first_image = False
 
-        # Per-image JSON
-        json_out = Path(OUTPUT_DIR) / image_id / "boxes.json"
-        json_out.parent.mkdir(parents=True, exist_ok=True)
-        with open(json_out, "w") as f:
-            json.dump(per_image_boxes, f, indent=2)
-
-        # Per-image masks NPZ
-        masks_to_save = {
-            r.replace(" ", "_"): m
-            for r, m in per_image_masks.items()
-            if m is not None
-        }
-        if masks_to_save:
-            np.savez_compressed(
-                str(Path(OUTPUT_DIR) / image_id / "masks.npz"),
-                **masks_to_save
-            )
+        # Per-image JSON + masks NPZ (best-effort)
+        try:
+            json_out = Path(OUTPUT_DIR) / image_id / "boxes.json"
+            json_out.parent.mkdir(parents=True, exist_ok=True)
+            with open(json_out, "w") as f:
+                json.dump(per_image_boxes, f, indent=2)
+            masks_to_save = {
+                r.replace(" ", "_"): m
+                for r, m in per_image_masks.items() if m is not None
+            }
+            if masks_to_save:
+                np.savez_compressed(
+                    str(Path(OUTPUT_DIR) / image_id / "masks.npz"), **masks_to_save
+                )
+        except Exception:
+            log.exception("image_id=%s: failed to write per-image JSON/NPZ", image_id)
 
     # ── SUMMARY ───────────────────────────────────────────────────────────────
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("SUMMARY")
-    print("="*60)
+    print("=" * 60)
+    print(f"Incremental results written to {summary_path}")
 
-    results_df   = pd.DataFrame(all_results)
-    summary_path = Path(OUTPUT_DIR) / "results_summary.csv"
-    results_df.to_csv(summary_path, index=False)
-    print(f"Full results saved to {summary_path}")
-
+    results_df = pd.DataFrame(all_results)
     if not results_df.empty:
         region_summary = (
             results_df.groupby("region")
             .agg(
-                detected = ("detected", "sum"),
-                total    = ("image_id", "count"),
-                mean_iou = ("iou",      "mean"),
+                detected=("detected", "sum"),
+                total=("region", "count"),
+                mean_iou=("iou", "mean"),
             )
             .reset_index()
         )
@@ -461,6 +449,9 @@ def main():
         overall_det = results_df["detected"].mean() * 100
         print(f"\nOverall mean IoU:       {overall_iou:.3f}")
         print(f"Overall detection rate: {overall_det:.1f}%")
+
+    print(f"\nCompleted: {images_processed} images, {regions_done} regions, "
+          f"{failed_count} failures")
 
 if __name__ == "__main__":
     main()
