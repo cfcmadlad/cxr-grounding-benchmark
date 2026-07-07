@@ -23,7 +23,7 @@ warnings.filterwarnings("ignore")
 
 # ── CONFIG + HF cache (must precede heavy imports) ────────────────────────────
 from cxr_common import (
-    load_config, setup_hf_home, load_image, find_image_file,
+    load_config, setup_hf_home, load_image, find_image_path,
     load_gold_annotations, validate_box, clamp_box, compute_iou,
     result_row, write_result_row, init_results_csv, BOX_FIELDS, get_logger,
 )
@@ -107,10 +107,27 @@ image_text_inference = ImageTextInferenceEngine(
 )
 image_text_inference.to(DEVICE)
 
-# Compatibility patch: batch_encode_plus removed in transformers >= 4.40
-def _batch_encode_plus_shim(batch_text_or_text_pairs, **kwargs):
-    return text_inference.tokenizer(batch_text_or_text_pairs, **kwargs)
-text_inference.tokenizer.batch_encode_plus = _batch_encode_plus_shim
+# Compatibility patch for tokenizer.batch_encode_plus (hi-ml-multimodal calls it;
+# newer transformers changed how it is exposed).
+#
+# BUG 2: the previous shim did `return text_inference.tokenizer(...)`. But
+# tokenizer.__call__ itself dispatches to batch_encode_plus, so the shim called
+# straight back into itself — "maximum recursion depth exceeded" on every region
+# and an empty results CSV. The fix must never route through __call__.
+_tok = text_inference.tokenizer
+_cls_bep = getattr(type(_tok), "batch_encode_plus", None)
+if _cls_bep is not None:
+    # Bind the class's real implementation onto this instance. It goes straight
+    # to the fast/slow _batch_encode_plus backend and never re-enters __call__.
+    _tok.batch_encode_plus = _cls_bep.__get__(_tok, type(_tok))
+else:
+    # batch_encode_plus genuinely absent: fall back to encode_plus per item —
+    # again, never through tokenizer.__call__.
+    def _batch_encode_plus_shim(batch_text_or_text_pairs, **kwargs):
+        if isinstance(batch_text_or_text_pairs, (list, tuple)):
+            return [_tok.encode_plus(t, **kwargs) for t in batch_text_or_text_pairs]
+        return _tok.encode_plus(batch_text_or_text_pairs, **kwargs)
+    _tok.batch_encode_plus = _batch_encode_plus_shim
 print("BioViL-T loaded.")
 
 print("Loading MedSAM...")
@@ -256,20 +273,23 @@ def main():
     regions_done = 0
     failed_count = 0
 
-    for img_idx, image_id in enumerate(image_ids):
+    def _process_image(img_idx, image_id):
+        # Entire per-image body. Wrapped by the caller in try/except so a single
+        # bad image can never stop the whole run.
+        nonlocal images_processed, regions_done, failed_count
         print(f"\n[{img_idx+1}/{len(image_ids)}] {image_id}")
 
-        img_path = find_image_file(IMAGE_DIR, image_id)
+        img_path = find_image_path(IMAGE_DIR, image_id)
         if img_path is None:
             log.error("image_id=%s: image file not found, skipping.", image_id)
             failed_count += 1
-            continue
+            return
 
         pil_img = load_image(img_path)
         if pil_img is None:
             log.error("image_id=%s: load_image returned None, skipping.", image_id)
             failed_count += 1
-            continue
+            return
 
         images_processed += 1
         W, H = pil_img.size
@@ -283,7 +303,7 @@ def main():
         except Exception:
             log.exception("image_id=%s: failed to write temp image, skipping.", image_id)
             failed_count += 1
-            continue
+            return
 
         per_image_boxes = {}
         per_image_masks = {}
@@ -382,6 +402,13 @@ def main():
                 )
         except Exception:
             log.exception("image_id=%s: failed to write per-image JSON/NPZ", image_id)
+
+    for img_idx, image_id in enumerate(image_ids):
+        try:
+            _process_image(img_idx, image_id)
+        except Exception:
+            failed_count += 1
+            log.exception("image_id=%s: unhandled per-image error, skipping.", image_id)
 
     # ── SUMMARY ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)

@@ -12,24 +12,24 @@
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate biomedparse
 
-export HF_HOME=/home/manik/cxr-grounding-benchmark/.cache/huggingface
-export TRANSFORMERS_CACHE=/home/manik/cxr-grounding-benchmark/.cache/huggingface
+export HF_HOME=/home/manik/pranjali/Aditya_project/.cache/huggingface
+export TRANSFORMERS_CACHE=/home/manik/pranjali/Aditya_project/.cache/huggingface
 # BiomedParse runs from inside its own repo, so make the benchmark's shared
 # module and config discoverable from there.
-export PYTHONPATH=/home/manik/cxr-grounding-benchmark:$PYTHONPATH
-export CXR_CONFIG=/home/manik/cxr-grounding-benchmark/config.yaml
-export CXR_REPO_ROOT=/home/manik/cxr-grounding-benchmark
+export PYTHONPATH=/home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-main:$PYTHONPATH
+export CXR_CONFIG=/home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-main/config.yaml
+export CXR_REPO_ROOT=/home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-main
 
-cd /home/manik/cxr-grounding-benchmark
+cd /home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-main
 
 # The BiomedParse custom classes are only importable with the repo dir as the
 # script dir, so copy the script (and shared module/config as a fallback) in.
 cp cxr_common.py config.yaml biomedparse_seg.py \
-   /home/manik/cxr-grounding-benchmark/BiomedParse/
+   /home/manik/pranjali/Aditya_project/BiomedParse/
 
-cd /home/manik/cxr-grounding-benchmark/BiomedParse
+cd /home/manik/pranjali/Aditya_project/BiomedParse
 python biomedparse_seg.py
 
-cd /home/manik/cxr-grounding-benchmark
+cd /home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-main
 python evaluate.py
 python compare_results.py

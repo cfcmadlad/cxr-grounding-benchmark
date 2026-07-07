@@ -31,7 +31,7 @@ warnings.filterwarnings("ignore")
 
 # ── CONFIG + HF cache (must precede heavy imports) ────────────────────────────
 from cxr_common import (
-    load_config, setup_hf_home, load_image, find_image_file,
+    load_config, setup_hf_home, load_image, find_image_path,
     load_gold_annotations, validate_box, clamp_box, compute_iou,
     result_row, write_result_row, init_results_csv, BOX_FIELDS, get_logger,
 )
@@ -319,20 +319,23 @@ def main():
     regions_done = 0
     failed_count = 0
 
-    for img_idx, image_id in enumerate(image_ids):
+    def _process_image(img_idx, image_id):
+        # Entire per-image body. Wrapped by the caller in try/except so a single
+        # bad image can never stop the whole run.
+        nonlocal images_processed, regions_done, failed_count
         print(f"\n[{img_idx+1}/{len(image_ids)}] {image_id}")
 
-        img_path = find_image_file(IMAGE_DIR, image_id)
+        img_path = find_image_path(IMAGE_DIR, image_id)
         if img_path is None:
             log.error("image_id=%s: image file not found, skipping.", image_id)
             failed_count += 1
-            continue
+            return
 
         pil_img = load_image(img_path)
         if pil_img is None:
             log.error("image_id=%s: load_image returned None, skipping.", image_id)
             failed_count += 1
-            continue
+            return
 
         images_processed += 1
         W, H = pil_img.size
@@ -431,6 +434,13 @@ def main():
                 )
         except Exception:
             log.exception("image_id=%s: failed to write per-image JSON/NPZ", image_id)
+
+    for img_idx, image_id in enumerate(image_ids):
+        try:
+            _process_image(img_idx, image_id)
+        except Exception:
+            failed_count += 1
+            log.exception("image_id=%s: unhandled per-image error, skipping.", image_id)
 
     # ── SUMMARY ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)

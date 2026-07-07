@@ -12,13 +12,13 @@
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate maira2
 
-export HF_HOME=/home/manik/cxr-grounding-benchmark/.cache/huggingface
-export TRANSFORMERS_CACHE=/home/manik/cxr-grounding-benchmark/.cache/huggingface
+export HF_HOME=/home/manik/pranjali/Aditya_project/.cache/huggingface
+export TRANSFORMERS_CACHE=/home/manik/pranjali/Aditya_project/.cache/huggingface
 
-cd /home/manik/cxr-grounding-benchmark
+cd /home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-main
 
 python maira2_medsam.py
 
-cd /home/manik/cxr-grounding-benchmark
+cd /home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-main
 python evaluate.py
 python compare_results.py

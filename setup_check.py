@@ -19,9 +19,17 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("CXR_CONFIG", os.path.join(REPO_ROOT, "config.yaml"))
 RESULTS_DIR = os.path.join(REPO_ROOT, "results")
 
-GOLD_REQUIRED_COLUMNS = ["image_id", "bbox_name", "x", "y", "w", "h"]
+# Two accepted gold-CSV layouts (setup_check accepts either):
+#   * bbox export : image_id, bbox_name, x, y, w, h
+#   * report list : study_id, subject_id, report  (the Sharanga HPC file)
+GOLD_BBOX_COLUMNS = {"image_id", "bbox_name", "x", "y", "w", "h"}
+GOLD_ID_COLUMNS = ("study_id", "image_id", "dicom_id")
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".dcm", ".dicom")
 CONDA_ENVS = ["gdino", "biovilt", "chexagent", "maira2", "radvlm", "biomedparse"]
+
+# Local weight files staged on the cluster (Section 10: "verify all weight files
+# exist"). Each entry is a config.yaml key that must point at an existing file.
+WEIGHT_FILE_KEYS = ["MEDSAM_WEIGHTS", "GDINO_WEIGHTS", "BIOVILT_WEIGHTS"]
 
 _failures = 0
 
@@ -92,12 +100,17 @@ def check_gold_csv(cfg):
     except Exception as e:
         report("GOLD_CSV readable", False, str(e))
         return
-    missing = [c for c in GOLD_REQUIRED_COLUMNS if c not in cols]
-    report(
-        "GOLD_CSV has columns " + ",".join(GOLD_REQUIRED_COLUMNS),
-        not missing,
-        f"missing {missing}; found {cols}" if missing else f"found {cols}",
-    )
+    report("GOLD_CSV readable", True, f"columns={cols}")
+    if GOLD_BBOX_COLUMNS.issubset(set(cols)):
+        report("GOLD_CSV schema", True, "bbox schema (image_id,bbox_name,x,y,w,h)")
+    elif any(c in cols for c in GOLD_ID_COLUMNS):
+        id_col = next(c for c in GOLD_ID_COLUMNS if c in cols)
+        report("GOLD_CSV schema", True,
+               f"report schema (id column '{id_col}'; images enumerated from it)")
+    else:
+        report("GOLD_CSV schema", False,
+               f"need bbox columns {sorted(GOLD_BBOX_COLUMNS)} or an id column "
+               f"{GOLD_ID_COLUMNS}; found {cols}")
 
 
 def check_image_dir(cfg):
@@ -148,6 +161,22 @@ def check_biomedparse(cfg):
     report("BIOMEDPARSE_REPO exists", os.path.isdir(path), path)
 
 
+def check_weight_files(cfg):
+    """Verify each staged weight file exists (Section 10)."""
+    for key in WEIGHT_FILE_KEYS:
+        path = cfg.get(key)
+        if not path:
+            report(f"{key} set", False, "empty/missing in config.yaml")
+            continue
+        report(f"{key} exists", os.path.isfile(path), path)
+    # BERT_PATH is a directory of files (local bert_base_uncased), not a single file.
+    bert = cfg.get("BERT_PATH")
+    if not bert:
+        report("BERT_PATH set", False, "empty/missing in config.yaml")
+    else:
+        report("BERT_PATH exists", os.path.isdir(bert), bert)
+
+
 def check_writable_dirs(cfg):
     out = cfg.get("OUTPUT_DIR")
     if out:
@@ -192,6 +221,7 @@ def main():
         check_image_dir(cfg)
         check_radvlm(cfg)
         check_biomedparse(cfg)
+        check_weight_files(cfg)
         check_writable_dirs(cfg)
     check_conda_envs()
 

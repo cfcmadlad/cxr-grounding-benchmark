@@ -5,23 +5,35 @@
 # Edit these values to match your cluster layout, then run setup_check.py to
 # verify everything before submitting the Slurm jobs.
 
-# Chest ImaGenome gold annotations CSV (columns: image_id, bbox_name, x, y, w, h)
-GOLD_CSV: "/home/manik/cxr-grounding-benchmark/data/gold_annotations.csv"
+# Gold report CSV. On this run it is the MIMIC/Chest ImaGenome report list with
+# columns: study_id, subject_id, report. Images are enumerated from study_id.
+# (load_gold_annotations also accepts a bbox CSV with columns
+#  image_id, bbox_name, x, y, w, h — it auto-detects the schema.)
+GOLD_CSV: "/home/manik/pranjali/Aditya_project/gold_images/gold_images/gold_1000k_reports.csv"
 
-# Root folder containing the CXR images (DICOM or PNG/JPG; searched recursively)
-IMAGE_DIR: "/home/manik/cxr-grounding-benchmark/data/images"
+# Root folder containing the CXR images (.jpg on this run; searched recursively).
+IMAGE_DIR: "/home/manik/pranjali/Aditya_project/gold_images/gold_images/gold_images"
 
-# Folder containing the RadVLM weights downloaded from PhysioNet
-RADVLM_PATH: "/home/manik/cxr-grounding-benchmark/data/radvlm_weights"
+# Folder containing the RadVLM weights downloaded from PhysioNet.
+RADVLM_PATH: "/home/manik/pranjali/Aditya_project/data/radvlm_weights"
 
 # Base output directory. Each model writes to OUTPUT_DIR/<model_name>/
-OUTPUT_DIR: "/home/manik/cxr-grounding-benchmark/outputs"
+OUTPUT_DIR: "/home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-main/outputs"
 
-# Maximum number of images to process (null = all). 500 = full gold subset.
-MAX_IMAGES: 500
+# Maximum number of images to process (null = all). 844 = full gold subset.
+MAX_IMAGES: 844
 
-# HuggingFace cache location (weights are downloaded / cached here)
-HF_HOME: "/home/manik/cxr-grounding-benchmark/.cache/huggingface"
+# HuggingFace cache location (weights are downloaded / cached here).
+HF_HOME: "/home/manik/pranjali/Aditya_project/.cache/huggingface"
 
-# Path to the cloned BiomedParse repository (required by biomedparse_seg.py)
-BIOMEDPARSE_REPO: "/home/manik/cxr-grounding-benchmark/BiomedParse"
+# Path to the cloned BiomedParse repository (required by biomedparse_seg.py).
+BIOMEDPARSE_REPO: "/home/manik/pranjali/Aditya_project/BiomedParse"
+
+# Local weight files staged on the cluster (verified by setup_check.py). The
+# model scripts load MedSAM / Grounding DINO / BioViL-T from the HuggingFace
+# cache under HF_HOME; these paths document the offline-staged checkpoints and
+# are checked for existence during pre-flight.
+MEDSAM_WEIGHTS: "/home/manik/pranjali/Aditya_project/medsam_vit_b.pth"
+GDINO_WEIGHTS: "/home/manik/pranjali/Aditya_project/grounding_dino_swint_ogc.pth"
+BIOVILT_WEIGHTS: "/home/manik/pranjali/Aditya_project/biovilt_image_model_proj_size_128.pt"
+BERT_PATH: "/home/manik/pranjali/Aditya_project/bert_base_uncased_local"

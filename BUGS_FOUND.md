@@ -13,6 +13,99 @@ GPU node, Slurm, 24 h wall-time on `gpu`).
 
 ---
 
+# Round 2 — fixes after the failed Sharanga HPC production run
+
+The first pass (everything below this section) was written against assumptions
+about the data layout. A real production run on Sharanga then failed. The
+confirmed-from-logs bugs and the environment mismatch behind them are fixed
+here. **Real HPC paths (all under `/home/manik/pranjali/Aditya_project/`):**
+
+| Thing | Path |
+|---|---|
+| Images (`.jpg`, NOT `.dcm`) | `gold_images/gold_images/gold_images/` |
+| Gold CSV (`study_id,subject_id,report`) | `gold_images/gold_images/gold_1000k_reports.csv` |
+| Repo | `cxr-grounding-benchmark-main/` |
+| MedSAM / GDINO / BioViL-T / BERT weights | `medsam_vit_b.pth`, `grounding_dino_swint_ogc.pth`, `biovilt_image_model_proj_size_128.pt`, `bert_base_uncased_local/` |
+
+### R2.0 — CRITICAL blocker: gold CSV schema mismatch (every script, startup)
+
+The real `GOLD_CSV` is a **report list** with columns `study_id, subject_id,
+report` — it has **no bounding boxes**. `load_gold_annotations()` *required*
+`image_id, bbox_name, x, y, w, h` and **raised `ValueError`** otherwise, so every
+one of the six scripts crashed at `load_gold_annotations(GOLD_CSV)` **before
+producing a single row** — independent of the image-path bug.
+
+**Fix (`cxr_common.load_gold_annotations`):** auto-detect the schema. Bbox CSV →
+`{image_id: {bbox_name: [x1,y1,x2,y2]}}` as before. Report CSV → enumerate images
+from `study_id` (falls back to `image_id` / `dicom_id`), each mapping to an
+**empty** box dict. Downstream, `gold_box` is `None`, `compute_iou(pred, None)`
+returns `None`, and detection / predicted boxes are still recorded — so the run
+produces the full **844 × 15 = 12 660** rows per model instead of crashing.
+`setup_check.py` now accepts either schema too.
+
+### R2.1 — BUG 1: `.dcm` hardcoded, images are `.jpg` (all 6 scripts)
+
+Image lookup went through `find_image_file`, which never tried `image_id` as a
+full filename and used `.dcm` in its extension list ahead of nothing useful.
+Added **`find_image_path(image_dir, image_id)`** to `cxr_common.py` exactly as
+specified: tries `.jpg/.jpeg/.png/.dcm/.dicom` (jpg first — that is what the HPC
+`gold_images/` dir contains), then `image_id` as a complete filename, then a
+recursive fallback. All six scripts import and call `find_image_path`
+(`find_image_file` kept as an alias).
+
+### R2.2 — BUG 2: BioViL-T infinite recursion (`biovilt_medsam.py`)
+
+The `batch_encode_plus` compatibility shim did `return
+text_inference.tokenizer(...)`. But `tokenizer.__call__` dispatches **into**
+`batch_encode_plus`, so the shim called itself forever → *"maximum recursion
+depth exceeded"* on every region, empty results CSV. **Fix:** bind the
+tokenizer class's real `batch_encode_plus` onto the instance (goes straight to
+the fast/slow backend, never re-enters `__call__`); if the method is genuinely
+absent, fall back to `encode_plus` per item — again never through `__call__`.
+Partial-result safety was already covered by the incremental CSV writer + the
+per-region `try/except` that writes a row on failure.
+
+### R2.3 — BUG 3: CheXagent produced zero output (`chexagent_medsam.py`)
+
+Raw model output was printed only for the first image, so a silent box-parse
+failure looked like "no output at all". Now the **raw model output is printed
+after every inference call** (`RAW[<image>/<region>]: ...`). The per-region CSV
+write already fires for every region regardless of whether a box parsed
+(`detected=False`, `iou=None` when it does not), so a row is emitted for all
+844 × 15 regions.
+
+### R2.4 — BUG 4: MAIRA-2 stopped after ~4 images (all 6 scripts)
+
+Only the per-region block was guarded; an unhandled error in the per-image scope
+(outside that block) aborted the whole run (~61 rows ≈ 4 images). The per-image
+body is now a nested `_process_image()` called inside
+`try/except Exception` in the loop, so **one bad image can never stop the run** —
+it is logged with the `image_id`, `failed_count` is incremented, and the loop
+continues. Applied identically to all six scripts. Each still prints
+`Completed: X images, Y regions, Z failures`.
+
+### R2.5 — Infrastructure: config, jobs, setup, weights
+
+- **`config.yaml`** rewritten with the real Sharanga paths and the exact
+  Section-7 keys, including the staged local weight files (`MEDSAM_WEIGHTS`,
+  `GDINO_WEIGHTS`, `BIOVILT_WEIGHTS`, `BERT_PATH`) and `MAX_IMAGES: 844`.
+- **All six `job_*.sh`** repointed to
+  `/home/manik/pranjali/Aditya_project/...` (repo `cxr-grounding-benchmark-main`,
+  cache `.cache/huggingface`); `job_biomedparse.sh` `cd`s into `BiomedParse` and
+  exports `PYTHONPATH`/`CXR_CONFIG`/`CXR_REPO_ROOT` accordingly. SBATCH headers,
+  `--mem` (8/8/40/40/40/8 G) and conda envs were already correct.
+- **`setup_check.py`** now accepts the report-CSV schema and verifies the staged
+  weight files (`MEDSAM_WEIGHTS`, `GDINO_WEIGHTS`, `BIOVILT_WEIGHTS`, `BERT_PATH`)
+  exist, per Section 10.
+- **MedSAM weights (documented deviation):** the scripts load MedSAM (and
+  Grounding DINO / BioViL-T) from the HuggingFace cache under `HF_HOME`, which is
+  what loaded successfully on the failed runs. The raw `*.pth`/`*.pt` checkpoints
+  in `config.yaml` are staged for offline use and verified by `setup_check.py`;
+  rewiring the HF loaders to raw checkpoints would change model-loading logic and
+  is intentionally out of scope ("do not change model inference logic").
+
+---
+
 ## 1. CRITICAL — runtime crashes (would abort a whole 23 h job)
 
 | # | File | Bug | Fix |

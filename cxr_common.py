@@ -472,42 +472,94 @@ def write_result_row(csv_path, row, fieldnames):
 # ── GOLD ANNOTATIONS ──────────────────────────────────────────────────────────
 
 def load_gold_annotations(csv_path):
-    """Load the Chest ImaGenome gold CSV.
+    """Load the gold CSV, auto-detecting its schema.
 
-    Expected columns: image_id, bbox_name, x, y, w, h  (x,y = top-left corner,
-    w,h = width/height in pixels). Returns
-    ``{image_id: {bbox_name_lower: [x1, y1, x2, y2]}}``.
+    Two layouts are supported:
+
+    1. **Bounding-box CSV** (Chest ImaGenome scene-graph export) with columns
+       ``image_id, bbox_name, x, y, w, h`` (x,y = top-left corner, w,h in pixels).
+       Returns ``{image_id: {bbox_name_lower: [x1, y1, x2, y2]}}``.
+
+    2. **Report CSV** (the file used on the Sharanga HPC run,
+       ``gold_1000k_reports.csv``) with columns ``study_id, subject_id, report``.
+       There are no gold boxes in this file, so it is used only to enumerate the
+       images: ``study_id`` becomes the image id and each maps to an empty box
+       dict. Downstream, ``gold_box`` is therefore ``None`` and IoU stays ``None``
+       while predicted boxes / detection are still recorded for every region.
+
+    Returns an ordered ``dict`` (insertion order = CSV row order) so
+    ``list(gold.keys())[:MAX_IMAGES]`` is deterministic.
     """
     import pandas as pd
     df = pd.read_csv(csv_path)
-    required = {"image_id", "bbox_name", "x", "y", "w", "h"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(
-            f"Gold CSV is missing columns: {missing}\n"
-            f"Found columns: {list(df.columns)}\n"
-            "Update REGION_TO_BBOX_NAME / the column names in load_gold_annotations()."
-        )
-    gold = {}
-    for _, r in df.iterrows():
-        iid = str(r["image_id"])
-        name = str(r["bbox_name"]).lower().strip()
-        box = [int(r["x"]), int(r["y"]),
-               int(r["x"]) + int(r["w"]),
-               int(r["y"]) + int(r["h"])]
-        gold.setdefault(iid, {})[name] = box
-    return gold
+    cols = set(df.columns)
+
+    bbox_cols = {"image_id", "bbox_name", "x", "y", "w", "h"}
+    if bbox_cols.issubset(cols):
+        gold = {}
+        for _, r in df.iterrows():
+            iid = str(r["image_id"])
+            name = str(r["bbox_name"]).lower().strip()
+            box = [int(r["x"]), int(r["y"]),
+                   int(r["x"]) + int(r["w"]),
+                   int(r["y"]) + int(r["h"])]
+            gold.setdefault(iid, {})[name] = box
+        _log.info("Loaded bbox gold CSV: %d images with annotations.", len(gold))
+        return gold
+
+    # Report CSV: enumerate images from study_id (no gold boxes available).
+    id_col = None
+    for candidate in ("study_id", "image_id", "dicom_id"):
+        if candidate in cols:
+            id_col = candidate
+            break
+    if id_col is not None:
+        gold = {}
+        for v in df[id_col].tolist():
+            iid = str(v).strip()
+            if iid and iid.lower() != "nan":
+                gold.setdefault(iid, {})   # empty box dict — no gold boxes
+        _log.info("Loaded report gold CSV (%s): %d unique images, no gold boxes.",
+                  id_col, len(gold))
+        return gold
+
+    raise ValueError(
+        "Gold CSV has neither the bbox schema (image_id, bbox_name, x, y, w, h) "
+        "nor an id column (study_id / image_id / dicom_id).\n"
+        f"Found columns: {list(df.columns)}"
+    )
 
 
-def find_image_file(image_dir, image_id):
-    """Find an image file for ``image_id`` under ``image_dir`` (flat or nested)."""
-    from pathlib import Path
-    image_dir = Path(image_dir)
+def find_image_path(image_dir, image_id):
+    """Resolve the on-disk path of the image for ``image_id`` under ``image_dir``.
+
+    The images on the HPC run are ``.jpg`` files (NOT ``.dcm``), so extensions
+    are tried in that order. Resolution order:
+      1. flat file ``image_dir/<image_id><ext>`` for each known extension;
+      2. ``image_id`` used as an already-complete filename (with extension);
+      3. a recursive search under ``image_dir`` for nested layouts.
+    Returns a path string, or ``None`` if nothing matches.
+    """
+    image_id = str(image_id)
+    # 1. Flat directory, extension-by-extension (.jpg first — that is what the
+    #    HPC gold_images/ directory contains).
     for ext in (".jpg", ".jpeg", ".png", ".dcm", ".dicom"):
-        p = image_dir / f"{image_id}{ext}"
-        if p.exists():
+        p = os.path.join(image_dir, image_id + ext)
+        if os.path.exists(p):
             return p
-        matches = list(image_dir.rglob(f"{image_id}{ext}"))
+    # 2. image_id may already include the extension (a full filename).
+    p = os.path.join(image_dir, image_id)
+    if os.path.exists(p):
+        return p
+    # 3. Recursive fallback for nested layouts (e.g. p10/s5xxxx/<id>.jpg).
+    from pathlib import Path
+    root = Path(image_dir)
+    for ext in (".jpg", ".jpeg", ".png", ".dcm", ".dicom"):
+        matches = list(root.rglob(f"{image_id}{ext}"))
         if matches:
-            return matches[0]
+            return str(matches[0])
     return None
+
+
+# Backwards-compatible alias (older code imported ``find_image_file``).
+find_image_file = find_image_path
