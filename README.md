@@ -4,6 +4,38 @@ Benchmarking visual grounding models for localizing 15 anatomical regions in che
 
 ---
 
+## Configuration & Running on Sharanga HPC
+
+All paths live in **`config.yaml`** at the repo root — the model scripts no
+longer have hardcoded paths. Edit `config.yaml` once (GOLD_CSV, IMAGE_DIR,
+RADVLM_PATH, OUTPUT_DIR, MAX_IMAGES, HF_HOME, BIOMEDPARSE_REPO), then:
+
+```bash
+# 1. Verify the environment before submitting any job (CI-friendly, exits 1 on failure)
+python setup_check.py
+
+# 2. Submit one Slurm job per model (each activates its own conda env,
+#    runs the model, then evaluate.py + compare_results.py):
+sbatch job_gdino.sh
+sbatch job_biovilt.sh
+sbatch job_chexagent.sh
+sbatch job_maira2.sh
+sbatch job_radvlm.sh
+sbatch job_biomedparse.sh
+```
+
+Each job writes its `results_summary.csv` **incrementally** (one row per region)
+to `OUTPUT_DIR/<model>/`, so partial results survive if a job is killed near the
+24 h wall-time. `evaluate.py` aggregates all available models and updates
+`results/results.json` (under an `fcntl.flock` lock); `compare_results.py` writes
+`results/comparison_table.md`, showing not-yet-run models as `pending`.
+
+The commands under each model below still work for **interactive** single-model
+runs; on the cluster prefer the `sbatch job_*.sh` scripts above. See
+`BUGS_FOUND.md` and `COMPATIBILITY_REPORT.md` for the full audit and env notes.
+
+---
+
 ## Target Regions (15)
 
 Right Lung, Left Lung, Cardiac Silhouette, Mediastinum, Trachea,
@@ -25,7 +57,7 @@ Grounding DINO is an open-vocabulary object detector trained on natural images. 
 conda create -n gdino python=3.10 -y && conda activate gdino
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements_grounding_dino.txt
-# edit GOLD_CSV, IMAGE_DIR, OUTPUT_DIR at top of script, set MAX_IMAGES=10 first
+# set paths in config.yaml (repo root); set MAX_IMAGES: 10 for a quick test first
 python grounding_dino_medsam.py
 ```
 
@@ -42,7 +74,7 @@ BioViL-T is a Microsoft model pretrained on MIMIC-CXR image-report pairs using c
 conda create -n biovilt python=3.10 -y && conda activate biovilt
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements_biovilt.txt
-# edit GOLD_CSV, IMAGE_DIR, OUTPUT_DIR at top of script, set MAX_IMAGES=10 first
+# set paths in config.yaml (repo root); set MAX_IMAGES: 10 for a quick test first
 # tune PERCENTILE (default 90) if boxes are too large/small
 python biovilt_medsam.py
 ```
@@ -62,8 +94,8 @@ RadVLM is a 7B multitask conversational VLM built on LLaVA-OneVision, instructio
 conda create -n radvlm python=3.10 -y && conda activate radvlm
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements_radvlm.txt
-# edit RADVLM_PATH, GOLD_CSV, IMAGE_DIR, OUTPUT_DIR at top of script
-# set MAX_IMAGES=10 for first run
+# set RADVLM_PATH and the other paths in config.yaml (repo root)
+# set MAX_IMAGES: 10 in config.yaml for the first run
 python radvlm_medsam.py
 ```
 
@@ -83,7 +115,7 @@ conda create -n maira2 python=3.10 -y && conda activate maira2
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements_maira2.txt
 huggingface-cli login   # paste HF token; only needed once
-# edit GOLD_CSV, IMAGE_DIR, OUTPUT_DIR at top of script, set MAX_IMAGES=10 first
+# set paths in config.yaml (repo root); set MAX_IMAGES: 10 for a quick test first
 python maira2_medsam.py
 ```
 
@@ -100,7 +132,7 @@ CheXagent-8b is a Stanford AIMI foundation model instruction-tuned on 28 chest X
 conda create -n chexagent python=3.10 -y && conda activate chexagent
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements_chexagent.txt
-# edit GOLD_CSV, IMAGE_DIR, OUTPUT_DIR at top of script, set MAX_IMAGES=10 first
+# set paths in config.yaml (repo root); set MAX_IMAGES: 10 for a quick test first
 # check printed raw responses on first run to verify box parsing format
 python chexagent_medsam.py
 ```
@@ -122,7 +154,10 @@ conda create -n biomedparse python=3.9.19 -y && conda activate biomedparse
 conda install pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvidia -y
 pip install -r assets/requirements/requirements.txt
 pip install -r requirements_biomedparse.txt   # place this file inside BiomedParse/
-# copy biomedparse_seg.py AND cxr_common.py inside BiomedParse/, edit config at top, then:
+# set BIOMEDPARSE_REPO (and the other paths) in config.yaml at the repo root.
+# The Slurm job (job_biomedparse.sh) copies the script + cxr_common.py + config.yaml
+# into BiomedParse/ and sets PYTHONPATH/CXR_CONFIG for you. To run by hand:
+#   cp cxr_common.py config.yaml biomedparse_seg.py BiomedParse/ && cd BiomedParse
 python biomedparse_seg.py
 ```
 
@@ -130,11 +165,13 @@ python biomedparse_seg.py
 
 ## Evaluation
 
-Run after any or all model scripts complete:
+Run after any or all model scripts complete (the `job_*.sh` scripts already do
+this at the end of every job):
 
 ```bash
-conda activate radvlm
-python evaluate.py
+conda activate radvlm            # any env with pandas/matplotlib/pyyaml
+python evaluate.py               # aggregates results + updates results/results.json
+python compare_results.py        # writes results/comparison_table.md
 ```
 
 Results saved to `outputs/evaluation/`:
@@ -156,7 +193,7 @@ Results saved to `outputs/evaluation/`:
 
 | Script | Env | Python | transformers |
 |---|---|---|---|
-| `grounding_dino_medsam.py` | `gdino` | 3.10 | >=4.40 |
+| `grounding_dino_medsam.py` | `gdino` | 3.10 | >=4.38 |
 | `biovilt_medsam.py` | `biovilt` | 3.10 | >=4.30,<4.40 |
 | `radvlm_medsam.py` | `radvlm` | 3.10 | ==4.46.0 |
 | `maira2_medsam.py` | `maira2` | 3.10 | >=4.48,<4.52 |

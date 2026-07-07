@@ -7,39 +7,57 @@ on the Chest ImaGenome gold subset.
 IMPORTANT — this script is structurally different from the others.
 BiomedParse uses custom model classes (BaseModel, build_model, etc.) that are
 not available as a pip package. The script MUST be placed and run from inside
-the cloned BiomedParse repository directory, and cxr_common.py (the shared
-image loader / IoU / Dice helpers used by every script in this benchmark)
-MUST be copied alongside it:
+the cloned BiomedParse repository directory (BIOMEDPARSE_REPO in config.yaml):
 
     git clone https://github.com/microsoft/BiomedParse.git
     cd BiomedParse
-    # copy biomedparse_seg.py AND cxr_common.py here, then run it
+    # place this script here, then run it (the Slurm job does this for you)
 
-Requirements: see requirements_biomedparse.txt (uses conda env 'biomedparse',
-Python 3.9.19 as specified in the official BiomedParse environment.yml)
+Because it runs from inside the BiomedParse repo, the Slurm job exports
+PYTHONPATH and CXR_CONFIG so that ``cxr_common`` and ``config.yaml`` (which live
+at the benchmark repo root) are still importable / findable.
 
 Key difference from other scripts:
-  - BiomedParse outputs MASKS directly from text prompts.
-  - No MedSAM step needed — this model IS the segmenter.
-  - We derive a bounding box from the predicted mask (smallest enclosing box)
-    for comparison with box-based models, but mask/Dice is the primary metric.
-  - Output scores are sigmoid logits; threshold at 0.5 for binary mask.
+  - BiomedParse outputs MASKS directly from text prompts. No MedSAM step.
+  - A bounding box is derived from the predicted mask (smallest enclosing box)
+    for cross-model comparison, but mask/Dice is the primary metric.
+  - Output scores are sigmoid logits; threshold at 0.5 for a binary mask.
 """
 
 import os
-
-# ── CONFIG (edit these, or override via environment variables of the same name)
-GOLD_CSV        = os.environ.get("GOLD_CSV", "/path/to/gold_bbox.csv")
-IMAGE_DIR       = os.environ.get("IMAGE_DIR", "/path/to/mimic_cxr_images")
-OUTPUT_DIR      = os.environ.get("OUTPUT_DIR", "./outputs/biomedparse")
-_max_images_env = os.environ.get("MAX_IMAGES")
-MAX_IMAGES      = int(_max_images_env) if _max_images_env else None
-MASK_THRESHOLD  = float(os.environ.get("MASK_THRESHOLD", 0.5))
-# ──────────────────────────────────────────────────────────────────────────────
-
+import sys
 import json
 import warnings
 warnings.filterwarnings("ignore")
+
+# ── CONFIG + shared utils (must precede heavy imports) ────────────────────────
+try:
+    from cxr_common import (
+        load_config, setup_hf_home, load_image, find_image_path,
+        load_gold_annotations, validate_box, compute_iou, compute_dice,
+        result_row, write_result_row, init_results_csv, BOX_FIELDS_DICE, get_logger,
+    )
+except ImportError:
+    # Running from inside the BiomedParse repo: the Slurm job sets PYTHONPATH to
+    # the benchmark root. As a fallback for interactive runs, honor CXR_REPO_ROOT.
+    _root = os.environ.get("CXR_REPO_ROOT")
+    if _root and _root not in sys.path:
+        sys.path.insert(0, _root)
+    from cxr_common import (
+        load_config, setup_hf_home, load_image, find_image_path,
+        load_gold_annotations, validate_box, compute_iou, compute_dice,
+        result_row, write_result_row, init_results_csv, BOX_FIELDS_DICE, get_logger,
+    )
+
+log = get_logger("biomedparse")
+cfg = load_config(required_keys=["GOLD_CSV", "IMAGE_DIR", "OUTPUT_DIR", "BIOMEDPARSE_REPO"])
+setup_hf_home(cfg)
+
+GOLD_CSV       = cfg["GOLD_CSV"]
+IMAGE_DIR      = cfg["IMAGE_DIR"]
+OUTPUT_DIR     = os.path.join(cfg["OUTPUT_DIR"], "biomedparse")
+MAX_IMAGES     = cfg.get("MAX_IMAGES")
+MASK_THRESHOLD = 0.5   # sigmoid threshold for binary mask
 
 import numpy as np
 import pandas as pd
@@ -52,10 +70,7 @@ from PIL import Image
 
 import torch
 
-from cxr_common import load_image, find_image_file, box_iou, mask_dice
-
-# BiomedParse custom classes — these only work when the script is run
-# from inside the cloned BiomedParse repo directory.
+# BiomedParse custom classes — only importable when running from inside the repo.
 try:
     from modeling.BaseModel import BaseModel
     from modeling import build_model
@@ -67,15 +82,13 @@ except ImportError as e:
     raise ImportError(
         f"BiomedParse custom classes not found: {e}\n"
         "Make sure you are running this script from inside the cloned "
-        "BiomedParse repo directory:\n"
+        "BiomedParse repo directory (BIOMEDPARSE_REPO in config.yaml):\n"
         "  git clone https://github.com/microsoft/BiomedParse.git\n"
         "  cd BiomedParse\n"
         "  python biomedparse_seg.py"
     )
 
 # ── 15 TARGET REGIONS ─────────────────────────────────────────────────────────
-# BiomedParse uses free-text prompts — these are our best-effort phrasings.
-# Chest X-ray is one of the 9 supported modalities (X-Ray-Chest).
 REGIONS = [
     "right lung",
     "left lung",
@@ -136,26 +149,21 @@ print("BiomedParse loaded.")
 # ── MASK UTILITIES ────────────────────────────────────────────────────────────
 
 def mask_to_box(binary_mask):
-    """Derive smallest enclosing bounding box from binary mask."""
+    """Derive the smallest enclosing box from a binary mask.
+
+    np.where returns (row_indices, col_indices) = (ys, xs). The box is built as
+    [col_min, row_min, col_max, row_max] = [x1, y1, x2, y2] — NOT
+    [row_min, col_min, ...]. Returns None for an empty mask.
+    """
     ys, xs = np.where(binary_mask)
     if len(xs) == 0:
         return None
-    # +1 on the upper bound: xs.max()/ys.max() are the last INCLUDED
-    # pixel index, but gold boxes (built as [x, y, x+w, y+h]) and every
-    # other model's boxes in this benchmark use an EXCLUSIVE upper bound.
-    # Without +1, every BiomedParse-derived box was 1 pixel too narrow.
-    return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+    return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
 
 def gold_box_to_mask(gold_box, img_h, img_w):
     """Convert gold box [x1,y1,x2,y2] to a binary mask for Dice scoring."""
     mask = np.zeros((img_h, img_w), dtype=bool)
     x1, y1, x2, y2 = [int(v) for v in gold_box]
-    # Clamp to valid array bounds: a negative x1/y1 would otherwise be
-    # interpreted by numpy as a from-the-end slice index (e.g. mask[-5:10]
-    # selects from the end of the array), silently producing a wildly
-    # wrong mask instead of the intended top-left-anchored box.
-    x1, x2 = max(0, x1), min(img_w, x2)
-    y1, y2 = max(0, y1), min(img_h, y2)
     mask[y1:y2, x1:x2] = True
     return mask
 
@@ -163,12 +171,6 @@ def gold_box_to_mask(gold_box, img_h, img_w):
 
 def save_region_png(pil_image, region, pred_mask, pred_box, gold_box,
                     dice, iou, image_id, out_dir):
-    """
-    3-panel figure for one region:
-      Left:   original CXR + derived pred box (red) + gold box (green)
-      Middle: CXR + predicted mask overlay + gold box outline
-      Right:  stats panel
-    """
     img_np = np.array(pil_image)
     H, W = img_np.shape[:2]
 
@@ -240,173 +242,186 @@ def save_region_png(pil_image, region, pred_mask, pred_box, gold_box,
     plt.close()
     return out_path
 
-# ── GOLD ANNOTATION LOADER ────────────────────────────────────────────────────
-
-def load_gold_annotations(csv_path):
-    df = pd.read_csv(csv_path)
-    required = {"image_id", "bbox_name", "x", "y", "w", "h"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(
-            f"Gold CSV is missing columns: {missing}\n"
-            f"Found columns: {list(df.columns)}\n"
-            "Please update REGION_TO_BBOX_NAME and column names in load_gold_annotations()."
-        )
-    gold = {}
-    for _, row in df.iterrows():
-        iid  = str(row["image_id"])
-        name = str(row["bbox_name"]).lower().strip()
-        box  = [int(row["x"]), int(row["y"]),
-                int(row["x"]) + int(row["w"]),
-                int(row["y"]) + int(row["h"])]
-        gold.setdefault(iid, {})[name] = box
-    return gold
-
 # ── MAIN LOOP ─────────────────────────────────────────────────────────────────
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    summary_path = str(Path(OUTPUT_DIR) / "results_summary.csv")
+    init_results_csv(summary_path)
 
     print(f"\nLoading gold annotations from {GOLD_CSV}...")
     gold_annotations = load_gold_annotations(GOLD_CSV)
     image_ids = list(gold_annotations.keys())
-    if MAX_IMAGES is not None:
+    if MAX_IMAGES:
         image_ids = image_ids[:MAX_IMAGES]
     print(f"{len(image_ids)} images to process.")
 
     all_results = []
+    images_processed = 0
+    regions_done = 0
+    failed_count = 0
 
-    for img_idx, image_id in enumerate(image_ids):
+    def _process_image(img_idx, image_id):
+        # Entire per-image body. Wrapped by the caller in try/except so a single
+        # bad image can never stop the whole run.
+        nonlocal images_processed, regions_done, failed_count
         print(f"\n[{img_idx+1}/{len(image_ids)}] {image_id}")
 
-        img_path = find_image_file(IMAGE_DIR, image_id)
+        img_path = find_image_path(IMAGE_DIR, image_id)
         if img_path is None:
-            print(f"  Image file not found, skipping.")
-            continue
+            log.error("image_id=%s: image file not found, skipping.", image_id)
+            failed_count += 1
+            return
 
-        try:
-            pil_img = load_image(img_path)
-        except Exception as e:
-            print(f"  Failed to load image: {e}, skipping.")
-            continue
+        pil_img = load_image(img_path)
+        if pil_img is None:
+            log.error("image_id=%s: load_image returned None, skipping.", image_id)
+            failed_count += 1
+            return
 
+        images_processed += 1
         W, H = pil_img.size
 
-        # BiomedParse: run ALL regions in one call (batched by design).
-        # interactive_infer_image returns a list of pred masks (one per prompt),
-        # each as a float numpy array of shape (H, W) with values in [0, 1].
+        # BiomedParse: all regions in one batched call. On failure, record a
+        # failure row for every region and move on.
         try:
             with torch.no_grad():
                 pred_masks_raw = interactive_infer_image(
                     biomedparse_model, pil_img, REGIONS
                 )
-        except Exception as e:
-            print(f"  BiomedParse inference error: {e}, skipping image.")
-            continue
-
-        if len(pred_masks_raw) != len(REGIONS):
-            # zip() below would otherwise silently truncate to the
-            # shorter list, dropping some regions from this image's
-            # results with no error or warning at all.
-            print(
-                f"  WARNING: BiomedParse returned {len(pred_masks_raw)} masks "
-                f"for {len(REGIONS)} region prompts -- results for this image "
-                f"may be misaligned/incomplete, skipping."
-            )
-            continue
+        except Exception:
+            log.exception("image_id=%s: BiomedParse inference failed for all regions",
+                          image_id)
+            for region in REGIONS:
+                bbox_name = REGION_TO_BBOX_NAME.get(region, region).lower()
+                gold_box = gold_annotations[image_id].get(bbox_name)
+                write_result_row(
+                    summary_path,
+                    result_row(image_id, region, None, False, gold_box, None, dice=None),
+                    BOX_FIELDS_DICE,
+                )
+                failed_count += 1
+            return
 
         per_image_masks = {}
         per_image_boxes = {}
 
         for region, pred_raw in zip(REGIONS, pred_masks_raw):
-            # Threshold sigmoid output to get binary mask
-            pred_mask = (pred_raw > MASK_THRESHOLD).astype(bool)
-
-            # Resize mask to original image size if needed
-            if pred_mask.shape != (H, W):
-                pred_mask_img = Image.fromarray(pred_raw.astype(np.float32))
-                pred_mask_img = pred_mask_img.resize((W, H), Image.BILINEAR)
-                pred_mask = (np.array(pred_mask_img) > MASK_THRESHOLD)
-
-            per_image_masks[region] = pred_mask
-
-            # Derive bounding box from mask for comparison
-            pred_box = mask_to_box(pred_mask) if pred_mask.any() else None
-            per_image_boxes[region] = {"pred_box": pred_box}
-
-            # Gold box and derived gold mask
             bbox_name = REGION_TO_BBOX_NAME.get(region, region).lower()
-            gold_box  = gold_annotations[image_id].get(bbox_name)
+            gold_box = gold_annotations[image_id].get(bbox_name)
 
-            # Dice (mask vs gold-box-as-mask)
+            pred_mask = None
+            pred_box = None
             dice = None
-            if pred_mask.any() and gold_box:
-                gold_mask = gold_box_to_mask(gold_box, H, W)
-                dice = mask_dice(pred_mask, gold_mask)
-
-            # Box IoU (derived pred box vs gold box)
             iou = None
-            if pred_box and gold_box:
-                iou = box_iou(pred_box, gold_box)
 
-            detected = pred_mask.any()
-            print(
-                f"  {region}: Dice={f'{dice:.3f}' if dice is not None else 'N/A'}"
-                f"  IoU={f'{iou:.3f}' if iou is not None else 'N/A'}"
-                f"  detected={detected}"
-            )
+            try:
+                pred_raw = np.asarray(pred_raw)
+                # Threshold sigmoid output to a binary mask.
+                pred_mask = (pred_raw > MASK_THRESHOLD).astype(bool)
 
-            save_region_png(
-                pil_img, region, pred_mask if detected else None,
-                pred_box, gold_box, dice, iou, image_id, out_dir=OUTPUT_DIR
-            )
+                # Resize mask to original image size if the model returned a
+                # different resolution.
+                if pred_mask.shape != (H, W):
+                    pred_mask_img = Image.fromarray(pred_raw.astype(np.float32))
+                    pred_mask_img = pred_mask_img.resize((W, H), Image.BILINEAR)
+                    pred_mask = (np.array(pred_mask_img) > MASK_THRESHOLD)
 
-            all_results.append({
-                "image_id": image_id,
-                "region":   region,
-                "pred_box": pred_box,
-                "gold_box": gold_box,
-                "dice":     dice,
-                "iou":      iou,
-                "detected": detected,
-            })
+                per_image_masks[region] = pred_mask
 
-        # Per-image JSON
-        json_out = Path(OUTPUT_DIR) / image_id / "boxes.json"
-        json_out.parent.mkdir(parents=True, exist_ok=True)
-        with open(json_out, "w") as f:
-            json.dump(per_image_boxes, f, indent=2)
+                # Derive bounding box [x1,y1,x2,y2] from the mask.
+                pred_box = mask_to_box(pred_mask) if pred_mask.any() else None
+                if pred_box is not None:
+                    validate_box(pred_box, W, H)  # logs a warning if degenerate
+                per_image_boxes[region] = {"pred_box": pred_box}
 
-        # Per-image masks NPZ
-        masks_to_save = {
-            r.replace(" ", "_"): m
-            for r, m in per_image_masks.items()
-            if m is not None
-        }
-        if masks_to_save:
-            np.savez_compressed(
-                str(Path(OUTPUT_DIR) / image_id / "masks.npz"),
-                **masks_to_save
-            )
+                # Dice (mask vs gold-box-as-mask).
+                if pred_mask.any() and gold_box:
+                    gold_mask = gold_box_to_mask(gold_box, H, W)
+                    dice = compute_dice(pred_mask, gold_mask)
+
+                # Box IoU (derived pred box vs gold box).
+                iou = compute_iou(pred_box, gold_box)
+
+                detected = bool(pred_mask.any())
+                write_result_row(
+                    summary_path,
+                    result_row(image_id, region, iou, detected, gold_box, pred_box,
+                               dice=dice),
+                    BOX_FIELDS_DICE,
+                )
+                regions_done += 1
+
+                all_results.append({
+                    "image_id": image_id, "region": region,
+                    "dice": dice, "iou": iou, "detected": detected,
+                })
+
+                print(
+                    f"  {region}: Dice={f'{dice:.3f}' if dice is not None else 'N/A'}"
+                    f"  IoU={f'{iou:.3f}' if iou is not None else 'N/A'}"
+                    f"  detected={detected}"
+                )
+
+                try:
+                    save_region_png(
+                        pil_img, region, pred_mask if detected else None,
+                        pred_box, gold_box, dice, iou, image_id, out_dir=OUTPUT_DIR
+                    )
+                except Exception:
+                    log.exception("image_id=%s region=%s: visualization failed",
+                                  image_id, region)
+
+            except Exception:
+                failed_count += 1
+                log.exception("image_id=%s region=%s: post-processing failed",
+                              image_id, region)
+                write_result_row(
+                    summary_path,
+                    result_row(image_id, region, None, False, gold_box, None, dice=None),
+                    BOX_FIELDS_DICE,
+                )
+                continue
+
+        # Per-image JSON + masks NPZ (best-effort)
+        try:
+            json_out = Path(OUTPUT_DIR) / image_id / "boxes.json"
+            json_out.parent.mkdir(parents=True, exist_ok=True)
+            with open(json_out, "w") as f:
+                json.dump(per_image_boxes, f, indent=2)
+            masks_to_save = {
+                r.replace(" ", "_"): m
+                for r, m in per_image_masks.items() if m is not None
+            }
+            if masks_to_save:
+                np.savez_compressed(
+                    str(Path(OUTPUT_DIR) / image_id / "masks.npz"), **masks_to_save
+                )
+        except Exception:
+            log.exception("image_id=%s: failed to write per-image JSON/NPZ", image_id)
+
+    for img_idx, image_id in enumerate(image_ids):
+        try:
+            _process_image(img_idx, image_id)
+        except Exception:
+            failed_count += 1
+            log.exception("image_id=%s: unhandled per-image error, skipping.", image_id)
 
     # ── SUMMARY ───────────────────────────────────────────────────────────────
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("SUMMARY")
-    print("="*60)
+    print("=" * 60)
+    print(f"Incremental results written to {summary_path}")
 
-    results_df   = pd.DataFrame(all_results)
-    summary_path = Path(OUTPUT_DIR) / "results_summary.csv"
-    results_df.to_csv(summary_path, index=False)
-    print(f"Full results saved to {summary_path}")
-
+    results_df = pd.DataFrame(all_results)
     if not results_df.empty:
         region_summary = (
             results_df.groupby("region")
             .agg(
-                detected  = ("detected", "sum"),
-                total     = ("image_id", "count"),
-                mean_dice = ("dice",     "mean"),
-                mean_iou  = ("iou",      "mean"),
+                detected=("detected", "sum"),
+                total=("region", "count"),
+                mean_dice=("dice", "mean"),
+                mean_iou=("iou", "mean"),
             )
             .reset_index()
         )
@@ -414,16 +429,19 @@ def main():
             region_summary["detected"] / region_summary["total"] * 100
         ).round(1)
         region_summary["mean_dice"] = region_summary["mean_dice"].round(3)
-        region_summary["mean_iou"]  = region_summary["mean_iou"].round(3)
+        region_summary["mean_iou"] = region_summary["mean_iou"].round(3)
         print("\nPer-region results:")
         print(region_summary.sort_values("mean_dice", ascending=False).to_string(index=False))
 
         overall_dice = results_df["dice"].dropna().mean()
-        overall_iou  = results_df["iou"].dropna().mean()
-        overall_det  = results_df["detected"].mean() * 100
+        overall_iou = results_df["iou"].dropna().mean()
+        overall_det = results_df["detected"].mean() * 100
         print(f"\nOverall mean Dice:      {overall_dice:.3f}")
         print(f"Overall mean IoU:       {overall_iou:.3f}")
         print(f"Overall detection rate: {overall_det:.1f}%")
+
+    print(f"\nCompleted: {images_processed} images, {regions_done} regions, "
+          f"{failed_count} failures")
 
 if __name__ == "__main__":
     main()

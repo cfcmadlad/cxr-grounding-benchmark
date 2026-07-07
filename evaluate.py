@@ -18,19 +18,9 @@ Usage:
 No arguments needed — all paths are configured in the CONFIG block below.
 """
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-MODEL_OUTPUT_DIRS = {
-    "Grounding DINO": "./outputs/grounding_dino",
-    "BioViL-T":       "./outputs/biovilt",
-    "MAIRA-2":        "./outputs/maira2",
-    "CheXagent":      "./outputs/chexagent",
-    "RadVLM":         "./outputs/radvlm",
-    "BiomedParse":    "./outputs/biomedparse",
-}
-EVAL_OUTPUT_DIR = "./outputs/evaluation"
-# ──────────────────────────────────────────────────────────────────────────────
-
 import os
+import sys
+import json
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -42,7 +32,36 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from pathlib import Path
 
+from cxr_common import load_config, get_logger
+
+log = get_logger("evaluate")
+
+# ── CONFIG (all paths from config.yaml — nothing hardcoded) ───────────────────
+cfg = load_config(required_keys=["OUTPUT_DIR"])
+_OUT_BASE = cfg["OUTPUT_DIR"]
+
+# Display name -> per-model output subdirectory (must match each model script).
+MODEL_SUBDIRS = {
+    "Grounding DINO": "grounding_dino",
+    "BioViL-T":       "biovilt",
+    "MAIRA-2":        "maira2",
+    "CheXagent":      "chexagent",
+    "RadVLM":         "radvlm",
+    "BiomedParse":    "biomedparse",
+}
+MODEL_OUTPUT_DIRS = {
+    name: os.path.join(_OUT_BASE, sub) for name, sub in MODEL_SUBDIRS.items()
+}
+EVAL_OUTPUT_DIR = os.path.join(_OUT_BASE, "evaluation")
+
+# results/results.json lives next to this script (repo root).
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+RESULTS_JSON = os.path.join(RESULTS_DIR, "results.json")
+
+# ──────────────────────────────────────────────────────────────────────────────
+
 os.makedirs(EVAL_OUTPUT_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 REGIONS = [
     "right lung",
@@ -107,6 +126,115 @@ def compute_map_at_05(df):
     if len(valid) == 0:
         return 0.0
     return (valid["iou"] >= 0.5).mean() * 100
+
+# ── results/results.json TRACKING ─────────────────────────────────────────────
+
+# Locking is best-effort: fcntl exists on the Linux HPC but not on Windows.
+try:
+    import fcntl
+    _HAVE_FCNTL = True
+except ImportError:  # pragma: no cover - non-Unix dev machines
+    _HAVE_FCNTL = False
+
+_DEFAULT_METRICS = {
+    "iou_mean": None, "iou_median": None,
+    "recall_at_0.1": None, "recall_at_0.25": None, "recall_at_0.5": None,
+    "map_at_0.5": None, "num_samples": None, "num_failed": None,
+}
+
+
+def _default_results():
+    return {
+        name: {"run_date": "", "status": "pending",
+               "metrics": dict(_DEFAULT_METRICS)}
+        for name in MODEL_SUBDIRS
+    }
+
+
+def compute_model_metrics(model_df):
+    """Compute the results.json metric block for one model's rows.
+
+    Denominator for recall is all gold-present regions; iou_mean/median are over
+    successfully-scored rows; map@0.5 is the fraction of detected+scored
+    predictions reaching IoU>=0.5. All rates are fractions in [0,1].
+    """
+    gold_present = model_df[model_df["gold_box"].notna()]
+    scored = gold_present[gold_present["iou"].notna()]
+    n_gold = int(len(gold_present))
+    n_scored = int(len(scored))
+
+    def recall(t):
+        if n_gold == 0:
+            return None
+        return round(float((scored["iou"] >= t).sum()) / n_gold, 4)
+
+    detected = gold_present[gold_present["detected"] == True]
+    det_scored = detected[detected["iou"].notna()]
+    map05 = (round(float((det_scored["iou"] >= 0.5).mean()), 4)
+             if len(det_scored) else None)
+
+    return {
+        "iou_mean": round(float(scored["iou"].mean()), 4) if n_scored else None,
+        "iou_median": round(float(scored["iou"].median()), 4) if n_scored else None,
+        "recall_at_0.1": recall(0.1),
+        "recall_at_0.25": recall(0.25),
+        "recall_at_0.5": recall(0.5),
+        "map_at_0.5": map05,
+        "num_samples": n_gold,
+        "num_failed": int(n_gold - n_scored),
+    }
+
+
+def update_results_json(model_name, metrics):
+    """Update one model's entry in results/results.json under an exclusive lock.
+
+    fcntl.flock serialises concurrent writers so that jobs finishing at the same
+    time (each running evaluate.py at the end) do not corrupt the file.
+    """
+    import datetime
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    # Ensure the file exists before opening 'r+'.
+    if not os.path.exists(RESULTS_JSON):
+        with open(RESULTS_JSON, "w") as f:
+            json.dump(_default_results(), f, indent=2)
+
+    with open(RESULTS_JSON, "r+") as f:
+        if _HAVE_FCNTL:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                f.seek(0)
+                data = json.load(f)
+                if not isinstance(data, dict):
+                    data = _default_results()
+            except (json.JSONDecodeError, ValueError):
+                data = _default_results()
+
+            entry = data.get(model_name, {"run_date": "", "status": "pending",
+                                          "metrics": dict(_DEFAULT_METRICS)})
+            entry["run_date"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            entry["status"] = "complete"
+            entry["metrics"] = metrics
+            data[model_name] = entry
+
+            f.seek(0)
+            f.truncate()
+            json.dump(data, f, indent=2)
+            f.flush()
+        finally:
+            if _HAVE_FCNTL:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+print("\nUpdating results/results.json...")
+for model in models_available:
+    try:
+        metrics = compute_model_metrics(combined[combined["model"] == model])
+        update_results_json(model, metrics)
+        print(f"  {model}: results.json updated "
+              f"(iou_mean={metrics['iou_mean']}, map@0.5={metrics['map_at_0.5']})")
+    except Exception:
+        log.exception("Failed to update results.json for %s", model)
 
 # ── PER-REGION IoU TABLE ──────────────────────────────────────────────────────
 

@@ -1,0 +1,86 @@
+{
+  "Grounding DINO": {
+    "run_date": "",
+    "status": "pending",
+    "metrics": {
+      "iou_mean": null,
+      "iou_median": null,
+      "recall_at_0.1": null,
+      "recall_at_0.25": null,
+      "recall_at_0.5": null,
+      "map_at_0.5": null,
+      "num_samples": null,
+      "num_failed": null
+    }
+  },
+  "BioViL-T": {
+    "run_date": "",
+    "status": "pending",
+    "metrics": {
+      "iou_mean": null,
+      "iou_median": null,
+      "recall_at_0.1": null,
+      "recall_at_0.25": null,
+      "recall_at_0.5": null,
+      "map_at_0.5": null,
+      "num_samples": null,
+      "num_failed": null
+    }
+  },
+  "MAIRA-2": {
+    "run_date": "",
+    "status": "pending",
+    "metrics": {
+      "iou_mean": null,
+      "iou_median": null,
+      "recall_at_0.1": null,
+      "recall_at_0.25": null,
+      "recall_at_0.5": null,
+      "map_at_0.5": null,
+      "num_samples": null,
+      "num_failed": null
+    }
+  },
+  "CheXagent": {
+    "run_date": "",
+    "status": "pending",
+    "metrics": {
+      "iou_mean": null,
+      "iou_median": null,
+      "recall_at_0.1": null,
+      "recall_at_0.25": null,
+      "recall_at_0.5": null,
+      "map_at_0.5": null,
+      "num_samples": null,
+      "num_failed": null
+    }
+  },
+  "RadVLM": {
+    "run_date": "",
+    "status": "pending",
+    "metrics": {
+      "iou_mean": null,
+      "iou_median": null,
+      "recall_at_0.1": null,
+      "recall_at_0.25": null,
+      "recall_at_0.5": null,
+      "map_at_0.5": null,
+      "num_samples": null,
+      "num_failed": null
+    }
+  },
+  "BiomedParse": {
+    "run_date": "",
+    "status": "pending",
+    "metrics": {
+      "iou_mean": null,
+      "iou_median": null,
+      "recall_at_0.1": null,
+      "recall_at_0.25": null,
+      "recall_at_0.5": null,
+      "map_at_0.5": null,
+      "num_samples": null,
+      "num_failed": null
+    }
+  }
+}

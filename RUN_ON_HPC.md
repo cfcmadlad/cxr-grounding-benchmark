@@ -65,44 +65,54 @@ which compute/login nodes won't have):
 
 ---
 
-## 3. Edit each job script's config block
+## 3. Edit `config.yaml` (single source of truth for all paths)
 
-Every `job_<model>.sh` has an editable block near the top:
+All paths live in **one** file, `config.yaml` at the repo root — the job
+scripts and every Python script read it via `cxr_common.load_config()`.
+Nothing is hardcoded in the scripts and the job scripts do **not** have
+per-model path blocks to edit.
 
-```bash
-GOLD_CSV="/path/to/gold_bbox.csv"
-IMAGE_DIR="/path/to/mimic_cxr_images"
-OUTPUT_DIR="./outputs/<model>"
-MAX_IMAGES=10
+```yaml
+GOLD_CSV:   "/home/.../gold_1000k_reports.csv"   # study_id,subject_id,report OR bbox CSV
+IMAGE_DIR:  "/home/.../gold_images"              # .jpg files (searched recursively)
+RADVLM_PATH:"/home/.../radvlm_weights"           # PhysioNet weights
+OUTPUT_DIR: "/home/.../outputs"                  # each model writes OUTPUT_DIR/<model>/
+MAX_IMAGES: 844                                  # null = all; lower it for a smoke test
+BIOMEDPARSE_REPO: "/home/.../BiomedParse"
+# staged local weight files (verified by setup_check.py):
+MEDSAM_WEIGHTS / GDINO_WEIGHTS / BIOVILT_WEIGHTS / BERT_PATH
 ```
 
-`job_radvlm.sh` additionally has `RADVLM_PATH`. `job_biomedparse.sh`
-additionally has `BIOMEDPARSE_REPO_DIR` (defaults to `$HOME/BiomedParse`,
-matching where `setup.sh` clones it).
+Then verify everything before submitting a single job:
 
-**Leave `MAX_IMAGES=10` for the first submission of every model** -- this
-is a smoke test to confirm the environment, paths, and (for the VLM
-scripts) the box-parsing regex actually work on your specific checkpoint
-before committing GPU-hours to a full run. Once a test run's
-`results_summary.csv` and per-region PNGs look sane, edit `MAX_IMAGES=""`
-(empty -> processes every image) and resubmit.
+```bash
+python setup_check.py     # PASS/FAIL per path, gold-CSV schema, weights, envs; exit 1 on any failure
+```
+
+**For a first smoke test, set `MAX_IMAGES` to a small number (e.g. 10)** in
+`config.yaml` to confirm the environment, paths, and (for the VLM scripts)
+the box-parsing regex work on your checkpoint before committing GPU-hours.
+Once a test run's `results_summary.csv` and per-region PNGs look sane, set
+`MAX_IMAGES: 844` (or `null` for every image) and resubmit.
 
 ---
 
 ## 4. Submit jobs
 
 ```bash
-sbatch job_gdino.sh
-sbatch job_biovilt.sh
-sbatch job_biomedparse.sh
-sbatch job_radvlm.sh        # needs RadVLM weights + 32G mem, ~16GB VRAM
-sbatch job_maira2.sh        # needs HF gated access + 32G mem, ~16GB VRAM
-sbatch job_chexagent.sh     # 32G mem, ~17.5GB VRAM
+sbatch job_gdino.sh         # 8G mem
+sbatch job_biovilt.sh       # 8G mem
+sbatch job_biomedparse.sh   # 8G mem
+sbatch job_radvlm.sh        # needs RadVLM weights + 40G mem, ~16GB VRAM
+sbatch job_maira2.sh        # needs HF gated access + 40G mem, ~16GB VRAM
+sbatch job_chexagent.sh     # 40G mem, ~17.5GB VRAM
 ```
 
-All 6 are independent and can run concurrently (each has its own conda
-env and output directory) as long as your account has enough concurrent
-GPU allocation.
+Each `job_<model>.sh` runs its model, then `evaluate.py` and
+`compare_results.py`, so `results.json` / `comparison_table.md` update as
+each job finishes. All 6 are independent and can run concurrently (each has
+its own conda env and output directory) as long as your account has enough
+concurrent GPU allocation.
 
 ---
 
@@ -116,10 +126,10 @@ squeue -u $USER --start                  # estimated start times if queued
 tail -f slurm.<jobid>.out
 tail -f slurm.<jobid>.err
 
-# for CheXagent specifically: PRINT_RAW_RESPONSES=1 prints the model's raw
-# text output for the first image, so check slurm.<jobid>.out early to
-# confirm box_from_response() is actually matching the output format:
-grep -A2 "RAW RESPONSE" slurm.<jobid>.out
+# for CheXagent specifically: the script prints the model's raw text output
+# after every inference call, so check slurm.<jobid>.out early to confirm
+# parse_box_from_response() is actually matching the output format:
+grep "RAW\[" slurm.<jobid>.out | head
 ```
 
 If a job fails, `slurm.<jobid>.err` almost always has the Python
@@ -139,6 +149,7 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate radvlm   # any env with pandas/matplotlib/numpy works
 cd cxr-grounding-benchmark
 python evaluate.py
+python compare_results.py
 ```
 
 Outputs land in `outputs/evaluation/`:
@@ -147,5 +158,9 @@ Outputs land in `outputs/evaluation/`:
 - `map_by_model.png`, `per_region_iou_by_model.png`, `iou_heatmap.png`
 - `per_region_dice_table.csv` (BiomedParse)
 
-Re-run `python evaluate.py` any time after more models finish -- it
-recomputes everything from each model's `results_summary.csv` on disk.
+`evaluate.py` also updates `results/results.json` (per-model metrics under an
+`fcntl.flock`), and `compare_results.py` renders `results/comparison_table.md`
+(best value per column bolded, incomplete models shown as `pending`).
+
+Re-run both any time after more models finish -- they recompute everything
+from each model's `results_summary.csv` on disk.

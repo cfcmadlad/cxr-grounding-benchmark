@@ -74,7 +74,7 @@ if contains radvlm "${ENVS_TO_BUILD[@]}"; then
     echo "NOTE: RadVLM weights require separate PhysioNet credentialed access:"
     echo "      https://physionet.org/content/radvlm-model/1.0.0/"
     echo "      Download them to a compute-node-visible path and set RADVLM_PATH"
-    echo "      in job_radvlm.sh before submitting."
+    echo "      in config.yaml before submitting."
 fi
 
 # ── 4. MAIRA-2 + MedSAM ───────────────────────────────────────────────────────
@@ -129,6 +129,7 @@ fi
 echo
 echo "=================================================================="
 echo "Setup complete for: ${ENVS_TO_BUILD[*]}"
-echo "Next: edit GOLD_CSV / IMAGE_DIR / OUTPUT_DIR / MAX_IMAGES at the top"
-echo "of each job_<model>.sh, then submit with: sbatch job_<model>.sh"
+echo "Next: edit paths in config.yaml (GOLD_CSV / IMAGE_DIR / OUTPUT_DIR /"
+echo "MAX_IMAGES / weight paths), verify with 'python setup_check.py', then"
+echo "submit with: sbatch job_<model>.sh"
 echo "=================================================================="

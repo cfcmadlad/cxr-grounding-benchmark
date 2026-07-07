@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts must always use LF so they run on the Linux HPC cluster.
+*.sh text eol=lf

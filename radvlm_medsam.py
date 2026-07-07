@@ -7,30 +7,44 @@ on the Chest ImaGenome gold subset.
 Requirements (install in a dedicated conda env):
     pip install torch torchvision
     pip install transformers==4.46.0
-    pip install accelerate pydicom Pillow numpy scipy matplotlib pandas
+    pip install accelerate pydicom Pillow numpy scipy matplotlib pandas pyyaml
 
-MedSAM is loaded from HuggingFace (wanglab/medsam-vit-base) — no manual
-checkpoint download needed.
+MedSAM is loaded from HuggingFace (wanglab/medsam-vit-base).
 
 RadVLM weights must be downloaded from PhysioNet:
     https://physionet.org/content/radvlm-model/1.0.0/
-Set RADVLM_PATH below to the folder containing those weights.
+The weights folder is read from config.yaml (RADVLM_PATH) — nothing hardcoded.
+
+RadVLM emits bounding boxes as NORMALIZED [x1, y1, x2, y2] in [0, 1] in free
+text. parse_box_from_response() therefore: parses 4 numbers with several
+fallback patterns, clamps every value to [0, 1], then denormalizes to pixel
+coordinates (x * img_w, y * img_h) before MedSAM. If no box parses the region
+is marked not-detected and MedSAM is skipped.
 """
 
 import os
-
-# ── CONFIG (edit these, or override via environment variables of the same name)
-RADVLM_PATH     = os.environ.get("RADVLM_PATH", "/path/to/radvlm/weights")
-GOLD_CSV        = os.environ.get("GOLD_CSV", "/path/to/gold_bbox.csv")
-IMAGE_DIR       = os.environ.get("IMAGE_DIR", "/path/to/mimic_cxr_images")
-OUTPUT_DIR      = os.environ.get("OUTPUT_DIR", "./outputs/radvlm")
-_max_images_env = os.environ.get("MAX_IMAGES")
-MAX_IMAGES      = int(_max_images_env) if _max_images_env else None
-# ──────────────────────────────────────────────────────────────────────────────
-
+import sys
+import re
 import json
 import warnings
 warnings.filterwarnings("ignore")
+
+# ── CONFIG + HF cache (must precede heavy imports) ────────────────────────────
+from cxr_common import (
+    load_config, setup_hf_home, load_image, find_image_path,
+    load_gold_annotations, validate_box, clamp_box, compute_iou,
+    result_row, write_result_row, init_results_csv, BOX_FIELDS, get_logger,
+)
+
+log = get_logger("radvlm")
+cfg = load_config(required_keys=["GOLD_CSV", "IMAGE_DIR", "OUTPUT_DIR", "RADVLM_PATH"])
+setup_hf_home(cfg)
+
+RADVLM_PATH = cfg["RADVLM_PATH"]
+GOLD_CSV    = cfg["GOLD_CSV"]
+IMAGE_DIR   = cfg["IMAGE_DIR"]
+OUTPUT_DIR  = os.path.join(cfg["OUTPUT_DIR"], "radvlm")
+MAX_IMAGES  = cfg.get("MAX_IMAGES")
 
 import numpy as np
 import pandas as pd
@@ -39,15 +53,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from pathlib import Path
-from PIL import Image
 
 import torch
 from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
 from transformers import SamModel, SamProcessor
-
-from cxr_common import (
-    load_image, find_image_file, box_iou, mask_dice, parse_box_from_response,
-)
 
 # ── 15 TARGET REGIONS ─────────────────────────────────────────────────────────
 REGIONS = [
@@ -69,7 +78,6 @@ REGIONS = [
 ]
 
 # Map from our region names to Chest ImaGenome bbox_name field values.
-# Adjust if the CSV uses different names.
 REGION_TO_BBOX_NAME = {
     "right lung":               "right lung",
     "left lung":                "left lung",
@@ -148,48 +156,70 @@ def inference_radvlm(model, processor, image, prompt, chat_history=None, max_new
         images=image, text=full_prompt, return_tensors="pt", padding=True
     ).to(model.device, torch.float16)
 
-    prompt_length = inputs["input_ids"].shape[-1]
-
     with torch.inference_mode():
         output = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
 
-    # Decode only the newly generated tokens (slicing by prompt_length in
-    # token space), instead of decoding the full prompt+completion output
-    # and trying to strip the chat-template role markers back out with
-    # re.split(r"(user|assistant)", ...). That approach had two real bugs:
-    #   1. It's case-sensitive and only matches lowercase "user"/
-    #      "assistant". LLaVA/Vicuna-style chat templates (which
-    #      LlavaOnevisionForConditionalGeneration -- RadVLM's architecture
-    #      -- commonly uses) render roles as "USER"/"ASSISTANT"
-    #      (uppercase), which this pattern never matches, silently
-    #      leaving the FULL prompt template concatenated in front of the
-    #      real answer in `response`.
-    #   2. Even when it does match, splitting on bare substrings "user"/
-    #      "assistant" anywhere in the decoded text is fragile -- it can
-    #      never be fully safe against those substrings appearing
-    #      elsewhere (e.g. inside prior turns replayed in multi-turn
-    #      history).
-    # Slicing by prompt_length sidesteps both problems entirely and
-    # matches the same fix applied to MAIRA-2 and CheXagent in this
-    # benchmark.
-    response = processor.decode(
-        output[0][prompt_length:], skip_special_tokens=True
-    ).strip()
+    full_response = processor.decode(output[0], skip_special_tokens=True)
+    response = re.split(r"(user|assistant)", full_response)[-1].strip()
     chat_history.append((prompt, response))
     return response, chat_history
 
 # ── BOX PARSING ───────────────────────────────────────────────────────────────
-#
-# RadVLM outputs boxes as normalized [0,1] coordinates in free text, e.g.
-# "[0.12, 0.34, 0.56, 0.78]" (confirmed against the RadVLM paper/repo).
-# parse_box_from_response() (imported from cxr_common) tries this format
-# plus several fallback formats (paired parens, bare numbers, 0-100/0-1000
-# scales) so a single robust parser is shared across every VLM script in
-# this benchmark instead of duplicating slightly-diverging regex logic.
+
+_NUM = r"(\d*\.?\d+)"
+_SEP = r"[\s,]+"
+
+# Ordered by specificity. Every pattern captures exactly 4 groups.
+_BOX_PATTERNS = [
+    # [x1, y1, x2, y2]  (primary RadVLM format)
+    r"\[\s*" + _NUM + _SEP + _NUM + _SEP + _NUM + _SEP + _NUM + r"\s*\]",
+    # (x1, y1, x2, y2)
+    r"\(\s*" + _NUM + _SEP + _NUM + _SEP + _NUM + _SEP + _NUM + r"\s*\)",
+    # <box>x1, y1, x2, y2</box>  (fallback 1: tagged output)
+    r"<box>\s*" + _NUM + _SEP + _NUM + _SEP + _NUM + _SEP + _NUM + r"\s*</box>",
+    # x1: .. y1: .. x2: .. y2: ..  (fallback 2: labeled fields)
+    r"x1\s*[:=]\s*" + _NUM + r".*?y1\s*[:=]\s*" + _NUM +
+    r".*?x2\s*[:=]\s*" + _NUM + r".*?y2\s*[:=]\s*" + _NUM,
+    # bare  x1, y1, x2, y2  (last resort)
+    _NUM + _SEP + _NUM + _SEP + _NUM + _SEP + _NUM,
+]
+
+
+def parse_box_from_response(response, img_w, img_h):
+    """
+    RadVLM outputs boxes as NORMALIZED [0,1] coordinates in its text response.
+    Parse with several fallback patterns, clamp each value to [0, 1], then
+    denormalize to pixel coordinates. Returns [x1, y1, x2, y2] in pixels, or
+    None if nothing usable parses.
+    """
+    if not response:
+        return None
+    for pattern in _BOX_PATTERNS:
+        match = re.search(pattern, response, flags=re.DOTALL | re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            vals = [float(match.group(i)) for i in range(1, 5)]
+        except (ValueError, IndexError):
+            continue
+        # Clamp normalized coordinates to [0, 1] before denormalizing.
+        vals = [min(max(v, 0.0), 1.0) for v in vals]
+        x1 = int(round(vals[0] * img_w))
+        y1 = int(round(vals[1] * img_h))
+        x2 = int(round(vals[2] * img_w))
+        y2 = int(round(vals[3] * img_h))
+        if x2 > x1 and y2 > y1:
+            return [x1, y1, x2, y2]
+    return None
 
 # ── MEDSAM SEGMENTATION ───────────────────────────────────────────────────────
 
 def get_medsam_mask(pil_image, box_xyxy):
+    """Segment inside box_xyxy (pixel x1y1x2y2 at original resolution).
+
+    SamProcessor resizes to 1024x1024 and rescales the box; the mask is resized
+    back to original dimensions by post_process_masks(original_sizes=...).
+    """
     inputs = medsam_processor(
         pil_image, input_boxes=[[box_xyxy]], return_tensors="pt"
     ).to(DEVICE)
@@ -219,12 +249,12 @@ def save_region_png(pil_image, region, pred_box, gold_box, mask, iou, image_id, 
     axes[0].imshow(img_np, cmap="gray")
     axes[0].set_title("Predicted (red) vs Gold (green)")
     if gold_box:
-        gx1, gy1, gx2, gy2 = gold_box
+        gx1, gy1, gx2, gy2 = [int(v) for v in gold_box]
         axes[0].add_patch(mpatches.Rectangle(
             (gx1, gy1), gx2 - gx1, gy2 - gy1,
             linewidth=2, edgecolor="lime", facecolor="none", label="Gold"))
     if pred_box:
-        px1, py1, px2, py2 = pred_box
+        px1, py1, px2, py2 = [int(v) for v in pred_box]
         axes[0].add_patch(mpatches.Rectangle(
             (px1, py1), px2 - px1, py2 - py1,
             linewidth=2, edgecolor="red", facecolor="none", label="Predicted"))
@@ -239,7 +269,7 @@ def save_region_png(pil_image, region, pred_box, gold_box, mask, iou, image_id, 
         overlay[mask] = [0.2, 0.6, 1.0, 0.45]
         axes[1].imshow(overlay)
     if gold_box:
-        gx1, gy1, gx2, gy2 = gold_box
+        gx1, gy1, gx2, gy2 = [int(v) for v in gold_box]
         axes[1].add_patch(mpatches.Rectangle(
             (gx1, gy1), gx2 - gx1, gy2 - gy1,
             linewidth=2, edgecolor="lime", facecolor="none"))
@@ -248,7 +278,7 @@ def save_region_png(pil_image, region, pred_box, gold_box, mask, iou, image_id, 
     # Panel 3: stats
     axes[2].axis("off")
     stats_lines = [
-        f"Model:   RadVLM + MedSAM",
+        "Model:   RadVLM + MedSAM",
         f"Image:   {image_id}",
         f"Region:  {region}",
         "",
@@ -270,160 +300,161 @@ def save_region_png(pil_image, region, pred_box, gold_box, mask, iou, image_id, 
     plt.close()
     return out_path
 
-# ── GOLD ANNOTATION LOADER ────────────────────────────────────────────────────
-
-def load_gold_annotations(csv_path):
-    """
-    Loads Chest ImaGenome gold CSV.
-    Expected columns: image_id, bbox_name, x, y, w, h
-      where x,y = top-left corner, w,h = width/height in pixels.
-    Returns dict: {image_id: {bbox_name: [x1, y1, x2, y2]}}
-    """
-    df = pd.read_csv(csv_path)
-    required = {"image_id", "bbox_name", "x", "y", "w", "h"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(
-            f"Gold CSV is missing columns: {missing}\n"
-            f"Found columns: {list(df.columns)}\n"
-            "Please update REGION_TO_BBOX_NAME and the column names in load_gold_annotations()."
-        )
-    gold = {}
-    for _, row in df.iterrows():
-        iid = str(row["image_id"])
-        name = str(row["bbox_name"]).lower().strip()
-        box = [int(row["x"]), int(row["y"]),
-               int(row["x"]) + int(row["w"]),
-               int(row["y"]) + int(row["h"])]
-        gold.setdefault(iid, {})[name] = box
-    return gold
-
 # ── MAIN LOOP ─────────────────────────────────────────────────────────────────
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    summary_path = str(Path(OUTPUT_DIR) / "results_summary.csv")
+    init_results_csv(summary_path)
 
     print(f"\nLoading gold annotations from {GOLD_CSV}...")
     gold_annotations = load_gold_annotations(GOLD_CSV)
     image_ids = list(gold_annotations.keys())
-    if MAX_IMAGES is not None:
+    if MAX_IMAGES:
         image_ids = image_ids[:MAX_IMAGES]
     print(f"{len(image_ids)} images to process.")
 
     all_results = []
+    images_processed = 0
+    regions_done = 0
+    failed_count = 0
 
-    for img_idx, image_id in enumerate(image_ids):
+    def _process_image(img_idx, image_id):
+        # Entire per-image body. Wrapped by the caller in try/except so a single
+        # bad image can never stop the whole run.
+        nonlocal images_processed, regions_done, failed_count
         print(f"\n[{img_idx+1}/{len(image_ids)}] {image_id}")
 
-        # Find image file
-        img_path = find_image_file(IMAGE_DIR, image_id)
+        img_path = find_image_path(IMAGE_DIR, image_id)
         if img_path is None:
-            print(f"  Image file not found, skipping.")
-            continue
+            log.error("image_id=%s: image file not found, skipping.", image_id)
+            failed_count += 1
+            return
 
-        try:
-            pil_img = load_image(img_path)
-        except Exception as e:
-            print(f"  Failed to load image: {e}, skipping.")
-            continue
+        pil_img = load_image(img_path)
+        if pil_img is None:
+            log.error("image_id=%s: load_image returned None, skipping.", image_id)
+            failed_count += 1
+            return
 
+        images_processed += 1
         W, H = pil_img.size
-
-        # RadVLM: one call per region (fresh chat each time)
         per_image_boxes = {}
         per_image_masks = {}
 
         for region in REGIONS:
-            prompt = (
-                f"Locate the {region} in this chest X-ray. "
-                f"Provide the bounding box as [x1, y1, x2, y2] "
-                f"with coordinates normalized between 0 and 1."
-            )
+            bbox_name = REGION_TO_BBOX_NAME.get(region, region).lower()
+            gold_box = gold_annotations[image_id].get(bbox_name)
+
+            pred_box = None
+            mask = None
+            iou = None
+            response = ""
+
             try:
+                prompt = (
+                    f"Locate the {region} in this chest X-ray. "
+                    f"Provide the bounding box as [x1, y1, x2, y2] "
+                    f"with coordinates normalized between 0 and 1."
+                )
                 response, _ = inference_radvlm(
                     radvlm_model, radvlm_processor, pil_img, prompt
                 )
                 pred_box = parse_box_from_response(response, W, H)
                 if pred_box is None:
-                    print(f"  {region}: could not parse box from response: {response[:80]}")
-            except Exception as e:
-                print(f"  {region}: inference error: {e}")
-                pred_box = None
-                response = ""
+                    log.info("image_id=%s region=%s: no box parsed from: %s",
+                             image_id, region, response[:120])
 
-            per_image_boxes[region] = {
-                "pred_box": pred_box,
-                "raw_response": response,
-            }
+                # Clamp + validate before MedSAM.
+                if pred_box is not None:
+                    pred_box = clamp_box(pred_box, W, H)
+                    if not validate_box(pred_box, W, H):
+                        pred_box = None
 
-            # MedSAM segmentation
-            mask = None
-            if pred_box is not None:
+                if pred_box is not None:
+                    try:
+                        mask = get_medsam_mask(pil_img, pred_box)
+                    except Exception:
+                        log.exception("image_id=%s region=%s: MedSAM failed",
+                                      image_id, region)
+                        mask = None
+                    iou = compute_iou(pred_box, gold_box)
+
+                detected = pred_box is not None
+                write_result_row(
+                    summary_path,
+                    result_row(image_id, region, iou, detected, gold_box, pred_box),
+                    BOX_FIELDS,
+                )
+                regions_done += 1
+
+                per_image_boxes[region] = {
+                    "pred_box": pred_box, "raw_response": response[:200]
+                }
+                per_image_masks[region] = mask
+                all_results.append({
+                    "image_id": image_id, "region": region,
+                    "iou": iou, "detected": detected,
+                })
+
+                print(f"  {region}: pred={pred_box}  gold={gold_box}  "
+                      f"IoU={f'{iou:.3f}' if iou is not None else 'N/A'}")
+
                 try:
-                    mask = get_medsam_mask(pil_img, pred_box)
-                except Exception as e:
-                    print(f"  {region}: MedSAM error: {e}")
-            per_image_masks[region] = mask
+                    save_region_png(pil_img, region, pred_box, gold_box, mask,
+                                    iou, image_id, out_dir=OUTPUT_DIR)
+                except Exception:
+                    log.exception("image_id=%s region=%s: visualization failed",
+                                  image_id, region)
 
-            # Gold box for this region
-            bbox_name = REGION_TO_BBOX_NAME.get(region, region).lower()
-            gold_box = gold_annotations[image_id].get(bbox_name)
+            except Exception:
+                failed_count += 1
+                log.exception("image_id=%s region=%s: inference block failed",
+                              image_id, region)
+                write_result_row(
+                    summary_path,
+                    result_row(image_id, region, None, False, gold_box, None),
+                    BOX_FIELDS,
+                )
+                continue
 
-            # IoU
-            iou = None
-            if pred_box and gold_box:
-                iou = box_iou(pred_box, gold_box)
+        # Per-image JSON + masks NPZ (best-effort)
+        try:
+            json_out = Path(OUTPUT_DIR) / image_id / "boxes.json"
+            json_out.parent.mkdir(parents=True, exist_ok=True)
+            with open(json_out, "w") as f:
+                json.dump(per_image_boxes, f, indent=2)
+            masks_to_save = {
+                r.replace(" ", "_"): m
+                for r, m in per_image_masks.items() if m is not None
+            }
+            if masks_to_save:
+                np.savez_compressed(
+                    str(Path(OUTPUT_DIR) / image_id / "masks.npz"), **masks_to_save
+                )
+        except Exception:
+            log.exception("image_id=%s: failed to write per-image JSON/NPZ", image_id)
 
-            iou_str = f"{iou:.3f}" if iou is not None else "N/A"
-            print(f"  {region}: pred={pred_box}  gold={gold_box}  IoU={iou_str}")
-
-            # Save per-region PNG
-            save_region_png(
-                pil_img, region, pred_box, gold_box, mask, iou, image_id,
-                out_dir=OUTPUT_DIR
-            )
-
-            all_results.append({
-                "image_id": image_id,
-                "region": region,
-                "pred_box": pred_box,
-                "gold_box": gold_box,
-                "iou": iou,
-                "detected": pred_box is not None,
-            })
-
-        # Save per-image JSON (boxes + scores)
-        json_out = Path(OUTPUT_DIR) / image_id / "boxes.json"
-        json_out.parent.mkdir(parents=True, exist_ok=True)
-        with open(json_out, "w") as f:
-            json.dump(per_image_boxes, f, indent=2)
-
-        # Save per-image masks NPZ
-        npz_out = Path(OUTPUT_DIR) / image_id / "masks.npz"
-        masks_to_save = {
-            r.replace(" ", "_"): m
-            for r, m in per_image_masks.items()
-            if m is not None
-        }
-        if masks_to_save:
-            np.savez_compressed(str(npz_out), **masks_to_save)
+    for img_idx, image_id in enumerate(image_ids):
+        try:
+            _process_image(img_idx, image_id)
+        except Exception:
+            failed_count += 1
+            log.exception("image_id=%s: unhandled per-image error, skipping.", image_id)
 
     # ── SUMMARY ───────────────────────────────────────────────────────────────
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("SUMMARY")
-    print("="*60)
+    print("=" * 60)
+    print(f"Incremental results written to {summary_path}")
 
     results_df = pd.DataFrame(all_results)
-    summary_path = Path(OUTPUT_DIR) / "results_summary.csv"
-    results_df.to_csv(summary_path, index=False)
-    print(f"Full results saved to {summary_path}")
-
     if not results_df.empty:
         region_summary = (
             results_df.groupby("region")
             .agg(
                 detected=("detected", "sum"),
-                total=("image_id", "count"),
+                total=("region", "count"),
                 mean_iou=("iou", "mean"),
             )
             .reset_index()
@@ -439,6 +470,9 @@ def main():
         overall_det = results_df["detected"].mean() * 100
         print(f"\nOverall mean IoU (detected only): {overall_iou:.3f}")
         print(f"Overall detection rate:           {overall_det:.1f}%")
+
+    print(f"\nCompleted: {images_processed} images, {regions_done} regions, "
+          f"{failed_count} failures")
 
 if __name__ == "__main__":
     main()
