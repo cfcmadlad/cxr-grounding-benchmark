@@ -119,8 +119,8 @@ REGION_TO_BBOX_NAME = {
     "left upper lung zone":     "left upper lung zone",
     "left mid lung zone":       "left mid lung zone",
     "left lower lung zone":     "left lower lung zone",
-    "right hilar region":       "right hilar structures",
-    "left hilar region":        "left hilar structures",
+    "right hilar region":       "right hilar region",
+    "left hilar region":        "left hilar region",
     "right costophrenic angle": "right costophrenic angle",
     "left costophrenic angle":  "left costophrenic angle",
 }

@@ -507,6 +507,32 @@ def load_gold_annotations(csv_path):
         _log.info("Loaded bbox gold CSV: %d images with annotations.", len(gold))
         return gold
 
+    # Real gold bbox CSV (original_x1/x2/y1/y2 order, from
+    # gold_bbox_coordinate_annotations_1000images.csv). Note the non-standard
+    # column order: original_x1, original_x2, original_y1, original_y2.
+    real_bbox_cols = {"image_id", "bbox_name",
+                       "original_x1", "original_x2",
+                       "original_y1", "original_y2"}
+    if real_bbox_cols.issubset(cols):
+        name_map = {
+            "upper mediastinum": "mediastinum",
+            "left hilar structures": "left hilar region",
+            "right hilar structures": "right hilar region",
+        }
+        gold = {}
+        for _, r in df.iterrows():
+            iid = str(r["image_id"]).strip()
+            if iid.lower().endswith(".dcm"):
+                iid = iid[:-4]
+            name = str(r["bbox_name"]).lower().strip()
+            name = name_map.get(name, name)
+            box = [float(r["original_x1"]), float(r["original_y1"]),
+                   float(r["original_x2"]), float(r["original_y2"])]
+            gold.setdefault(iid, {})[name] = box
+        _log.info("Loaded real gold bbox CSV (original_* coords): %d images.",
+                   len(gold))
+        return gold
+
     # Report CSV: enumerate images from study_id (no gold boxes available).
     id_col = None
     for candidate in ("study_id", "image_id", "dicom_id"):

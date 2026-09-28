@@ -93,8 +93,8 @@ REGION_TO_BBOX_NAME = {
     "left upper lung zone":     "left upper lung zone",
     "left mid lung zone":       "left mid lung zone",
     "left lower lung zone":     "left lower lung zone",
-    "right hilar region":       "right hilar structures",
-    "left hilar region":        "left hilar structures",
+    "right hilar region":       "right hilar region",
+    "left hilar region":        "left hilar region",
     "right costophrenic angle": "right costophrenic angle",
     "left costophrenic angle":  "left costophrenic angle",
 }
@@ -130,9 +130,12 @@ def maira_ground_phrase(pil_image, phrase):
     Run MAIRA-2 phrase grounding for a single phrase on a single image.
     Returns (pixel-coordinate box [x1, y1, x2, y2] or None, raw decoded text).
 
-    MAIRA-2 emits normalized coords relative to its cropped 518x518 view;
-    adjust_box_for_original_image_size() maps them back to original pixels
-    (accounting for the pad/centre-crop, not just a linear W/518, H/518 scale).
+    MAIRA-2 emits coords normalized to its square centre-crop.
+    adjust_box_for_original_image_size(box, width, height) undoes that crop --
+    but it returns coordinates STILL NORMALIZED to 0-1, now relative to the
+    original image ("The box normalised relative to the original size of the
+    image", processing_maira2.py:615). They must be multiplied by (W, H) to
+    become pixels; calling int() on them directly floors every coordinate to 0.
     """
     processed_inputs = maira_processor.format_and_preprocess_phrase_grounding_input(
         frontal_image=pil_image,
@@ -155,23 +158,26 @@ def maira_ground_phrase(pil_image, phrase):
 
     prediction = maira_processor.convert_output_to_plaintext_or_grounded_sequence(decoded_text)
 
-    # prediction is a list of (text, boxes_or_None) tuples.
-    if not prediction:
+    # prediction is EITHER a plain str (model answered without grounding tags)
+    # OR a list of (text, boxes_or_None) tuples. Unpacking prediction[0] on a
+    # str raises ValueError, which the caller logs as "inference block failed"
+    # and counts as an error -- an ungrounded answer is a legitimate "no box",
+    # not a failure.
+    if not prediction or isinstance(prediction, str):
         return None, decoded_text
 
     _, boxes = prediction[0]
     if not boxes:
         return None, decoded_text
 
-    # Take the first (usually only) box and adjust for original image size.
+    # Take the first (usually only) box and undo the square centre-crop.
     raw_box = boxes[0]  # normalized coords relative to MAIRA-2's cropped view
-    adjusted = maira_processor.adjust_box_for_original_image_size(
-        box=raw_box,
-        original_image=pil_image,
-    )
-    # adjusted is (x1, y1, x2, y2) in pixel coords of the original image.
-    x1, y1, x2, y2 = adjusted
-    return [int(x1), int(y1), int(x2), int(y2)], decoded_text
+    W, H = pil_image.size
+    adjusted = maira_processor.adjust_box_for_original_image_size(raw_box, W, H)
+
+    # adjusted is (x1, y1, x2, y2) NORMALIZED to 0-1 against the original image.
+    nx1, ny1, nx2, ny2 = adjusted
+    return [int(nx1 * W), int(ny1 * H), int(nx2 * W), int(ny2 * H)], decoded_text
 
 # ── MEDSAM SEGMENTATION ───────────────────────────────────────────────────────
 
@@ -317,7 +323,7 @@ def main():
             raw_resp = ""
 
             try:
-                pred_box, raw_resp = maira_ground_phrase(pil_img, region)
+                pred_box, raw_resp = maira_ground_phrase(pil_img, f"findings in the {region}")
 
                 # Clamp mapped-back box to image bounds and validate before MedSAM.
                 if pred_box is not None:

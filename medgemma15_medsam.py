@@ -1,24 +1,35 @@
 """
-chexagent_medsam.py
--------------------
-Self-contained script: CheXagent-8b + MedSAM for anatomical region grounding
-on the Chest ImaGenome gold subset.
+medgemma15_medsam.py
+---------------------
+Self-contained script: MedGemma 1.5 (4B) + MedSAM for anatomical region
+grounding on the Chest ImaGenome gold subset.
 
-Requirements: see requirements_chexagent.txt
+Model: google/medgemma-1.5-4b-it (gated; requires an HF token with approved
+access -- reuses the same HF_TOKEN already used by job_maira2.sh / this repo).
+Architecture: Gemma3ForConditionalGeneration, loaded via
+AutoModelForImageTextToText. Verified on this cluster (2026-09-12 smoke test,
+slurm_medgemma_smoke.340280.out) that the `gdino` env's transformers 5.13.0
+loads this model directly -- no separate conda env was needed.
 
-Model: StanfordAIMI/CheXagent-8b (open weights, no gated access needed)
-Paper: https://arxiv.org/abs/2401.12208
-
-All paths are read from config.yaml at the repo root — nothing is hardcoded.
-
-Notes on CheXagent phrase grounding:
-  - Evaluated primarily on pathology phrases, not anatomy names — expect lower
-    scores on normal anatomical region grounding (same caveat as MAIRA-2).
-  - Box output is parsed from free text. The RAW model output for the VERY
-    FIRST image is printed to stdout so the box format can be verified on HPC
-    and parse_box_from_response() adjusted if needed.
-  - Inference format from the official HF model card:
-    processor(images=images, text=" USER: <s>{prompt} ASSISTANT: <s>")
+>>> CRITICAL BOX FORMAT (verified against REAL model output, not assumed) <<<
+MedGemma follows the Gemini-family "box_2d" convention: a JSON list of
+objects, each ``{"box_2d": [y0, x0, y1, x1], "label": ...}``, with all four
+values integers on a 0-1000 NORMALIZED grid (NOT 0-1, NOT pixels) relative to
+the ORIGINAL image dimensions (not the resized 896x896 model input -- the
+896x896 resize is a non-aspect-preserving squash, so a fractional position
+along either axis is preserved regardless of which space it's expressed in).
+Order is Y BEFORE X -- opposite of every other model in this benchmark, which
+use [x1,y1,x2,y2]. Real example captured on this cluster for a 3056x2544
+image, region="right lung":
+    RAW RESPONSE: '```json\\n[{"box_2d": [160, 150, 830, 900], "label": "right lung"}]\\n```'
+Converted: x1=150/1000*3056=458, y1=160/1000*2544=407,
+           x2=900/1000*3056=2750, y2=830/1000*2544=2112.
+This particular example is a wide, imprecise box spanning most of the chest
+rather than tightly isolating the right lung -- MedGemma was not fine-tuned
+for anatomical-region grounding on CXRs, so wide/imprecise (but not
+nonsensical) boxes are an expected real result, not a parsing bug. This is
+exactly the kind of result that must be sanity-checked by eye per the smoke
+test requirement below, rather than trusted blindly from a single sample.
 """
 
 import os
@@ -35,15 +46,18 @@ from cxr_common import (
     result_row, write_result_row, init_results_csv, BOX_FIELDS, get_logger,
 )
 
-log = get_logger("chexagent")
+log = get_logger("medgemma15")
 cfg = load_config(required_keys=["GOLD_CSV", "IMAGE_DIR", "OUTPUT_DIR"])
 setup_hf_home(cfg)
 
 GOLD_CSV   = cfg["GOLD_CSV"]
 IMAGE_DIR  = cfg["IMAGE_DIR"]
-OUTPUT_DIR = os.path.join(cfg["OUTPUT_DIR"], "chexagent")
+OUTPUT_DIR = os.path.join(cfg["OUTPUT_DIR"], "medgemma15")
 MAX_IMAGES = cfg.get("MAX_IMAGES")
-PRINT_RAW_RESPONSES = True   # print raw model output on the first image
+PRINT_RAW_FIRST_N = 3   # print raw model output for the first N images for manual verification
+
+MODEL_ID = "google/medgemma-1.5-4b-it"
+BOX_GRID = 1000.0  # MedGemma/Gemini box_2d normalization grid
 
 import numpy as np
 import pandas as pd
@@ -54,8 +68,7 @@ import matplotlib.patches as mpatches
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig
-from transformers import SamModel, SamProcessor
+from transformers import AutoProcessor, AutoModelForImageTextToText
 
 # ── 15 TARGET REGIONS ─────────────────────────────────────────────────────────
 REGIONS = [
@@ -99,157 +112,129 @@ print(f"Device: {DEVICE}")
 
 # ── LOAD MODELS ───────────────────────────────────────────────────────────────
 
-print("Loading CheXagent-8b...")
-processor = AutoProcessor.from_pretrained(
-    "StanfordAIMI/CheXagent-8b",
-    trust_remote_code=True,
+print(f"Loading {MODEL_ID}...")
+processor = AutoProcessor.from_pretrained(MODEL_ID)
+medgemma_model = AutoModelForImageTextToText.from_pretrained(
+    MODEL_ID,
+    dtype=torch.bfloat16,
+    device_map=DEVICE,
 )
-generation_config = GenerationConfig.from_pretrained(
-    "StanfordAIMI/CheXagent-8b",
-)
-chexagent_model = AutoModelForCausalLM.from_pretrained(
-    "StanfordAIMI/CheXagent-8b",
-    torch_dtype=torch.float16,
-    trust_remote_code=True,
-).to(DEVICE)
-chexagent_model.eval()
-print("CheXagent-8b loaded.")
+medgemma_model.eval()
+print(f"{MODEL_ID} loaded.")
 
 print("Loading MedSAM...")
+from transformers import SamModel, SamProcessor
 medsam_processor = SamProcessor.from_pretrained("wanglab/medsam-vit-base")
 medsam_model = SamModel.from_pretrained("wanglab/medsam-vit-base").to(DEVICE)
 medsam_model.eval()
 print("MedSAM loaded.")
 
-# ── CHEXAGENT PHRASE GROUNDING ────────────────────────────────────────────────
+# ── MEDGEMMA GROUNDING ────────────────────────────────────────────────────────
 
-def chexagent_ground_phrase(pil_image, phrase, print_raw=False):
+_JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
+
+
+def medgemma_ground_region(pil_image, region, print_raw=False):
     """
-    Run CheXagent phrase grounding for a single phrase on a single image.
-    Returns (pixel-coordinate box [x1, y1, x2, y2] or None, raw response text).
+    Prompt MedGemma for a bounding box of one named anatomical region.
+    Returns (pixel-coordinate box [x1,y1,x2,y2] or None, raw response text).
     """
-    images = [pil_image]
-    prompt = (
-        f'Perform phrase grounding for "{phrase}" in this chest X-ray. '
-        f'Provide the bounding box as [x1, y1, x2, y2] in pixel coordinates.'
-    )
-    inputs = processor(
-        images=images,
-        text=f" USER: <s>{prompt} ASSISTANT: <s>",
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": pil_image},
+                {"type": "text", "text": (
+                    f'Detect the "{region}" in this chest X-ray image. '
+                    f'Return the bounding box as a JSON list with one object: '
+                    f'[{{"box_2d": [y0, x0, y1, x1], "label": "{region}"}}]. '
+                    f'Output ONLY the JSON, nothing else.'
+                )},
+            ],
+        }
+    ]
+
+    inputs = processor.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
         return_tensors="pt",
-    ).to(device=DEVICE, dtype=torch.float16)
+    ).to(medgemma_model.device, dtype=torch.bfloat16 if DEVICE == "cuda" else torch.float32)
+
+    input_len = inputs["input_ids"].shape[-1]
 
     with torch.no_grad():
-        output = chexagent_model.generate(
-            **inputs,
-            generation_config=generation_config,
-        )[0]
+        gen = medgemma_model.generate(**inputs, max_new_tokens=200, do_sample=False)
 
-    response = processor.tokenizer.decode(output, skip_special_tokens=True)
+    gen_tokens = gen[0][input_len:]
+    response = processor.decode(gen_tokens, skip_special_tokens=True)
 
     if print_raw:
-        print(f"    RAW RESPONSE for '{phrase}': {response[:200]}")
+        print(f"    RAW[{region}]: {response[:300]!r}")
 
     W, H = pil_image.size
     box = parse_box_from_response(response, W, H)
     return box, response
 
 
-_NUM = r"(\d*\.?\d+)"
-_SEP = r"[\s,]+"
-
-# CheXagent's NATIVE grounding format, e.g.
-#     <ref>Mediastinum</ref><box>(384,161),(601,284)</box>
-# Two parenthesised corner pairs, not four bare numbers. Coordinates are on a
-# 0-999 normalized grid (measured over 6528 values in slurm.264874.out:
-# min=145, max=878, none >999), NOT pixels -- they must be scaled by
-# (img_w/1000, img_h/1000). Treating them as pixels puts every box in a tiny
-# patch of the top-left corner.
-_CHEXAGENT_BOX_RE = re.compile(
-    r"<box>\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*,\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*</box>"
-)
-_CHEXAGENT_GRID = 1000.0
-
-# Fallback patterns for other free-text box shapes CheXagent sometimes emits.
-# NOTE: the old bare "four numbers anywhere" pattern was REMOVED -- it matched
-# digits in ordinary prose and manufactured fake detections (all 5 "successes"
-# in job 264874 came from it, every one with IoU exactly 0.0).
-_BOX_PATTERNS = [
-    r"\[\s*" + _NUM + _SEP + _NUM + _SEP + _NUM + _SEP + _NUM + r"\s*\]",   # [x1,y1,x2,y2]
-    r"\(\s*" + _NUM + _SEP + _NUM + _SEP + _NUM + _SEP + _NUM + r"\s*\)",   # (x1,y1,x2,y2)
-    r"<box>\s*" + _NUM + _SEP + _NUM + _SEP + _NUM + _SEP + _NUM + r"\s*</box>",
-    r"x1\s*[:=]\s*" + _NUM + r".*?y1\s*[:=]\s*" + _NUM +
-    r".*?x2\s*[:=]\s*" + _NUM + r".*?y2\s*[:=]\s*" + _NUM,
-]
-
-
-def _finalise_box(x1, y1, x2, y2, img_w, img_h):
-    """Order-normalise, clamp to the image, and reject degenerate boxes."""
-    x1, x2 = min(x1, x2), max(x1, x2)
-    y1, y2 = min(y1, y2), max(y1, y2)
-    x1 = int(round(min(max(x1, 0.0), img_w)))
-    y1 = int(round(min(max(y1, 0.0), img_h)))
-    x2 = int(round(min(max(x2, 0.0), img_w)))
-    y2 = int(round(min(max(y2, 0.0), img_h)))
-    if x2 > x1 and y2 > y1:
-        return [x1, y1, x2, y2]
-    return None
-
-
 def parse_box_from_response(response, img_w, img_h):
     """
-    Extract [x1, y1, x2, y2] pixel coordinates from CheXagent's response.
+    Extract [x1,y1,x2,y2] pixel coordinates from MedGemma's box_2d JSON.
 
-    CheXagent's native grounding format is tried first and scaled from its
-    0-999 grid to pixels. Only if that is absent do the free-text fallbacks
-    run; those use the old heuristic (values <= 1.0 are treated as normalized,
-    anything else as pixels). Returns None if nothing usable is found.
+    box_2d is [y0,x0,y1,x1] on a 0-1000 grid relative to the ORIGINAL image
+    dimensions (verified on real output -- see module docstring). Handles a
+    ```json fenced block or bare JSON. Returns None if nothing usable found.
     """
     if not response:
         return None
+    cleaned = response.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
 
-    # 1. Native <box>(x1,y1),(x2,y2)</box> -- 0-999 grid, scale to pixels.
-    m = _CHEXAGENT_BOX_RE.search(response)
-    if m:
-        gx1, gy1, gx2, gy2 = (float(v) for v in m.groups())
-        box = _finalise_box(
-            gx1 / _CHEXAGENT_GRID * img_w,
-            gy1 / _CHEXAGENT_GRID * img_h,
-            gx2 / _CHEXAGENT_GRID * img_w,
-            gy2 / _CHEXAGENT_GRID * img_h,
-            img_w, img_h,
-        )
-        if box is not None:
-            return box
-
-    # 2. Free-text fallbacks.
-    for pattern in _BOX_PATTERNS:
-        match = re.search(pattern, response, flags=re.DOTALL | re.IGNORECASE)
-        if not match:
-            continue
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        m = _JSON_ARRAY_RE.search(cleaned)
+        if not m:
+            return None
         try:
-            vals = [float(match.group(i)) for i in range(1, 5)]
-        except (ValueError, IndexError):
-            continue
-        if all(0.0 <= v <= 1.0 for v in vals):
-            # Normalized -> denormalize with correct dimensions (x*w, y*h).
-            box = _finalise_box(vals[0] * img_w, vals[1] * img_h,
-                                vals[2] * img_w, vals[3] * img_h, img_w, img_h)
-        else:
-            # Pixel coordinates -> clamp into the image.
-            box = _finalise_box(vals[0], vals[1], vals[2], vals[3], img_w, img_h)
-        if box is not None:
-            return box
-    return None
+            parsed = json.loads(m.group(0))
+        except Exception:
+            return None
+
+    if not isinstance(parsed, list) or len(parsed) == 0:
+        return None
+    entry = parsed[0]
+    if not isinstance(entry, dict) or "box_2d" not in entry:
+        return None
+    box_2d = entry["box_2d"]
+    if not isinstance(box_2d, (list, tuple)) or len(box_2d) != 4:
+        return None
+
+    try:
+        y0, x0, y1, x1 = [float(v) for v in box_2d]
+    except (TypeError, ValueError):
+        return None
+
+    # Normalized 0-1000 grid, Y BEFORE X -> pixel [x1,y1,x2,y2] in original image space.
+    px1 = x0 / BOX_GRID * img_w
+    py1 = y0 / BOX_GRID * img_h
+    px2 = x1 / BOX_GRID * img_w
+    py2 = y1 / BOX_GRID * img_h
+
+    px1, px2 = min(px1, px2), max(px1, px2)
+    py1, py2 = min(py1, py2), max(py1, py2)
+    if px2 <= px1 or py2 <= py1:
+        return None
+    return [px1, py1, px2, py2]
 
 # ── MEDSAM SEGMENTATION ───────────────────────────────────────────────────────
 
 def get_medsam_mask(pil_image, box_xyxy):
-    """Segment inside box_xyxy (pixel x1y1x2y2 at original resolution).
-
-    SamProcessor resizes to 1024x1024 and rescales the box; the mask is resized
-    back to original dimensions by post_process_masks(original_sizes=...).
-    """
     inputs = medsam_processor(
         pil_image, input_boxes=[[box_xyxy]], return_tensors="pt"
     ).to(DEVICE)
@@ -267,12 +252,8 @@ def get_medsam_mask(pil_image, box_xyxy):
 def save_region_png(pil_image, region, pred_box, gold_box, mask, iou, image_id, out_dir):
     img_np = np.array(pil_image)
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle(
-        f"CheXagent + MedSAM  |  {image_id}  |  {region}",
-        fontsize=11, y=1.01
-    )
+    fig.suptitle(f"MedGemma 1.5 (4B) + MedSAM  |  {image_id}  |  {region}", fontsize=11, y=1.01)
 
-    # Panel 1: boxes
     axes[0].imshow(img_np, cmap="gray")
     axes[0].set_title("Predicted (red) vs Gold (green)")
     if gold_box:
@@ -288,7 +269,6 @@ def save_region_png(pil_image, region, pred_box, gold_box, mask, iou, image_id, 
     axes[0].legend(loc="upper right", fontsize=8)
     axes[0].axis("off")
 
-    # Panel 2: MedSAM mask + gold outline
     axes[1].imshow(img_np, cmap="gray")
     axes[1].set_title("MedSAM mask + gold outline")
     if mask is not None:
@@ -302,10 +282,9 @@ def save_region_png(pil_image, region, pred_box, gold_box, mask, iou, image_id, 
             linewidth=2, edgecolor="lime", facecolor="none"))
     axes[1].axis("off")
 
-    # Panel 3: stats
     axes[2].axis("off")
     stats_lines = [
-        "Model:    CheXagent-8b + MedSAM",
+        "Model:    MedGemma 1.5 (4B) + MedSAM",
         f"Image:    {image_id}",
         f"Region:   {region}",
         "",
@@ -313,9 +292,6 @@ def save_region_png(pil_image, region, pred_box, gold_box, mask, iou, image_id, 
         "",
         f"Pred box: {pred_box}" if pred_box else "Pred box: not detected",
         f"Gold box: {gold_box}" if gold_box else "Gold box: not in annotations",
-        "",
-        "Note: CheXagent grounding is optimised",
-        "for pathology, not normal anatomy.",
     ]
     axes[2].text(
         0.05, 0.95, "\n".join(stats_lines),
@@ -352,8 +328,6 @@ def main():
     failed_count = 0
 
     def _process_image(img_idx, image_id):
-        # Entire per-image body. Wrapped by the caller in try/except so a single
-        # bad image can never stop the whole run.
         nonlocal images_processed, regions_done, failed_count
         print(f"\n[{img_idx+1}/{len(image_ids)}] {image_id}")
 
@@ -373,6 +347,7 @@ def main():
         W, H = pil_img.size
         per_image_boxes = {}
         per_image_masks = {}
+        print_raw = img_idx < PRINT_RAW_FIRST_N
 
         for region in REGIONS:
             bbox_name = REGION_TO_BBOX_NAME.get(region, region).lower()
@@ -384,16 +359,8 @@ def main():
             raw_resp = ""
 
             try:
-                pred_box, raw_resp = chexagent_ground_phrase(
-                    pil_img, region, print_raw=False
-                )
+                pred_box, raw_resp = medgemma_ground_region(pil_img, region, print_raw=print_raw)
 
-                # BUG 3: print the raw model output after EVERY inference call so
-                # box-parse failures are visible in the Slurm .out log (previously
-                # the run produced zero results with no diagnostic output).
-                print(f"    RAW[{image_id}/{region}]: {raw_resp[:200]!r}")
-
-                # Clamp + validate before MedSAM.
                 if pred_box is not None:
                     pred_box = clamp_box(pred_box, W, H)
                     if not validate_box(pred_box, W, H):
@@ -403,8 +370,7 @@ def main():
                     try:
                         mask = get_medsam_mask(pil_img, pred_box)
                     except Exception:
-                        log.exception("image_id=%s region=%s: MedSAM failed",
-                                      image_id, region)
+                        log.exception("image_id=%s region=%s: MedSAM failed", image_id, region)
                         mask = None
                     iou = compute_iou(pred_box, gold_box)
 
@@ -416,9 +382,7 @@ def main():
                 )
                 regions_done += 1
 
-                per_image_boxes[region] = {
-                    "pred_box": pred_box, "raw_response": raw_resp[:200]
-                }
+                per_image_boxes[region] = {"pred_box": pred_box, "raw_response": raw_resp[:300]}
                 per_image_masks[region] = mask
                 all_results.append({
                     "image_id": image_id, "region": region,
@@ -432,13 +396,11 @@ def main():
                     save_region_png(pil_img, region, pred_box, gold_box, mask,
                                     iou, image_id, out_dir=OUTPUT_DIR)
                 except Exception:
-                    log.exception("image_id=%s region=%s: visualization failed",
-                                  image_id, region)
+                    log.exception("image_id=%s region=%s: visualization failed", image_id, region)
 
             except Exception:
                 failed_count += 1
-                log.exception("image_id=%s region=%s: inference block failed",
-                              image_id, region)
+                log.exception("image_id=%s region=%s: inference block failed", image_id, region)
                 write_result_row(
                     summary_path,
                     result_row(image_id, region, None, False, gold_box, None),
@@ -446,7 +408,6 @@ def main():
                 )
                 continue
 
-        # Per-image JSON + masks NPZ (best-effort)
         try:
             json_out = Path(OUTPUT_DIR) / image_id / "boxes.json"
             json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -457,9 +418,7 @@ def main():
                 for r, m in per_image_masks.items() if m is not None
             }
             if masks_to_save:
-                np.savez_compressed(
-                    str(Path(OUTPUT_DIR) / image_id / "masks.npz"), **masks_to_save
-                )
+                np.savez_compressed(str(Path(OUTPUT_DIR) / image_id / "masks.npz"), **masks_to_save)
         except Exception:
             log.exception("image_id=%s: failed to write per-image JSON/NPZ", image_id)
 
@@ -470,7 +429,6 @@ def main():
             failed_count += 1
             log.exception("image_id=%s: unhandled per-image error, skipping.", image_id)
 
-    # ── SUMMARY ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
@@ -480,16 +438,10 @@ def main():
     if not results_df.empty:
         region_summary = (
             results_df.groupby("region")
-            .agg(
-                detected=("detected", "sum"),
-                total=("region", "count"),
-                mean_iou=("iou", "mean"),
-            )
+            .agg(detected=("detected", "sum"), total=("region", "count"), mean_iou=("iou", "mean"))
             .reset_index()
         )
-        region_summary["detection_rate"] = (
-            region_summary["detected"] / region_summary["total"] * 100
-        ).round(1)
+        region_summary["detection_rate"] = (region_summary["detected"] / region_summary["total"] * 100).round(1)
         region_summary["mean_iou"] = region_summary["mean_iou"].round(3)
         print("\nPer-region results:")
         print(region_summary.sort_values("mean_iou", ascending=False).to_string(index=False))

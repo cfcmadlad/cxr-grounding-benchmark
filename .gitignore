@@ -30,3 +30,20 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Backup files from iterative debugging
+*.bak
+*.bak2
+*.pre_verify_bak
+
+# Slurm logs (not source, regenerated on every run)
+slurm.*.out
+slurm.*.err
+slurm_*.out
+slurm_*.err
+
+# Smoke-test output dir
+outputs_smoketest/
+
+# Old audit backups
+.audit_backup_*/

@@ -18,10 +18,10 @@ IMAGE_DIR: "/home/manik/pranjali/Aditya_project/gold_images/gold_images/gold_ima
 RADVLM_PATH: "/home/manik/pranjali/Aditya_project/data/radvlm_weights"
 
 # Base output directory. Each model writes to OUTPUT_DIR/<model_name>/
-OUTPUT_DIR: "/home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed/outputs"
+OUTPUT_DIR: "/home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed/outputs_smoketest"
 
 # Maximum number of images to process (null = all). 844 = full gold subset.
-MAX_IMAGES: 1000
+MAX_IMAGES: 8
 
 # HuggingFace cache location (weights are downloaded / cached here).
 HF_HOME: "/home/manik/pranjali/Aditya_project/.cache/huggingface"
