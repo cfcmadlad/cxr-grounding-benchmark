@@ -12,11 +12,12 @@ query alone** — no radiology report is ever given as input.
 Images and model weights are not included — access requires a PhysioNet
 credentialed account (see [Data Access](#data-access)).
 
-**Contents:** [Results](#results) · [How the benchmark works](#how-the-benchmark-works) ·
+**Contents:** [Results](#results) · [Key findings](#key-findings) ·
+[How the benchmark works](#how-the-benchmark-works) ·
 [Prompts per model](#what-prompt-was-used-for-each-model) ·
-[Known issues](#known-issues-and-findings-read-before-citing-per-model-numbers) ·
-[Repo layout](#repository-layout) · [Running on HPC](#running-on-sharanga-hpc) ·
-[Models & setup](#models) · [Data access](#data-access)
+[Models & setup](#models) · [Repo layout](#repository-layout) ·
+[Running on HPC](#running-on-sharanga-hpc) · [Data access](#data-access) ·
+[Known issues](#known-issues-and-findings-read-before-citing-per-model-numbers)
 
 ---
 
@@ -59,6 +60,31 @@ supervision in this exact coordinate convention — it is the only model here
 trained end-to-end on the task being measured, which is the main reason for the
 gap. One image is missing its gold box for "right lower lung zone" and is handled
 identically for every model (see Known Issues).
+
+---
+
+## Key findings
+
+- **RadVLM is the clear leader** — 0.763 unconditional mean IoU with a 99.9%
+  detection rate, more than double the next model. It is the only model trained
+  with Chest ImaGenome box supervision, which shows how much task-specific
+  grounding training matters.
+- **RadVLM localizes even the small targets.** Its raw IoU on the costophrenic
+  angles is low, but 95% of its predictions reach IoU ≥ 0.1 and ~90% contain the
+  gold box's center — it finds the right spot almost every time, and IoU simply
+  penalizes small offsets on small structures.
+- **MAIRA-2 is the second most accurate when it answers** (0.433 conditional
+  IoU), and on report-style regions such as the lung zones it answers up to 94.1%
+  of the time.
+- **BiomedParse is a strong generalist** — third overall (0.254) with a 94.7%
+  detection rate, from a text-prompted segmentation model covering 9 imaging
+  modalities.
+- **Full coverage, one protocol.** All 8 models ran to completion on all 959
+  images × 15 regions (14,385 queries each) with identical inputs and scoring,
+  so the numbers are directly comparable.
+- **Bugs were caught by reading raw outputs.** Smoke tests with hand-read model
+  responses found MedGemma's y-before-x coordinate order and CheXagent's
+  placeholder echo before they could silently distort results.
 
 ---
 
@@ -150,177 +176,6 @@ region names, the same task (produce a box for this named region), and
 | MAIRA-2 | MAIRA-2's own grounded-reporting generation call | Region name passed as the grounding target; MAIRA-2 generates its own report-style text and links a box to it when the phrasing reads as a "finding" (see Known Issues) |
 | BiomedParse | Text-prompted segmentation API | Region name as the segmentation prompt; box = bounding rectangle of the predicted mask |
 | ChEX | CLIP-style text encoder, not a generative prompt | Title-case anatomy name from ChEX's own training vocabulary (`conf/dataset/anatomy_names/cig_default.yaml`), e.g. `"Right lung."` — all 15 regions encoded once per image in a single batched call |
-
----
-
-## Known issues and findings (read before citing per-model numbers)
-
-Found via a systematic audit (per-region left/right cross-checks, raw-response
-inspection, and source-level verification for ChEX) after the full runs. They
-are documented rather than silently fixed so anyone using this benchmark can see
-exactly what was checked.
-
-| Model | Issue | Status | Effect on numbers |
-|---|---|---|---|
-| ChEX | Left/right anatomical confusion | ✅ Verified genuine (source-traced) | Real model property — numbers stand |
-| CheXagent | Prompt-format mismatch (echoes placeholder) | ⚠️ Unresolved | 0.095 / 0.011 likely **understate** it |
-| MAIRA-2 | Task-framing mismatch on whole-organ regions | ⚠️ Unresolved | 0.433 / 0.313 likely **understate** it |
-| MedGemma 1.5 | Mild left/right confusion on 3 regions | Likely genuine, unconfirmed | Numbers stand |
-| All | 1 missing gold annotation | Handled identically | No ranking change |
-| All | Costophrenic-angle IoU is misleading | Context needed | Check recall@0.1 |
-
-### ChEX: genuine left/right confusion (verified against source, not a harness bug)
-ChEX's predictions for left-labeled regions systematically land near the
-correct *right*-side structure instead of the correct left-side one (e.g.
-"left lung" prediction matches "right lung" gold at IoU 0.41 vs only 0.16
-against its own "left lung" gold). This was traced through ChEX's actual
-`encode_prompts()`/`detect_prompts()` source
-(`chex/src/model/chex.py:448-515`): prompt order is correctly preserved
-end-to-end, box regression is conditioned purely on each prompt's own text
-embedding, and there is no fixed-vocabulary index lookup that could explain a
-harness-side swap. "Right lung" and "left lung" produce genuinely different
-(not duplicated) box coordinates on the same image, ruling out a simple
-aliasing bug. The most likely explanation is that ChEX's text encoder does not
-sufficiently separate "left" from "right" anatomical prompts to drive its box
-head to the correct hemisphere — a real property of the trained model, not
-something fixable in this evaluation harness. Reported as a finding, not
-patched.
-
-### CheXagent: likely prompt-format mismatch (not fully resolved — do not treat 0.095/0.011 as final)
-Inspecting raw model responses shows CheXagent frequently returns the literal
-placeholder text `"[x1, y1, x2, y2]"` from our prompt instruction instead of
-generating real coordinates. Critically, on the queries where it *does*
-ground successfully, it spontaneously uses its own native output format
-(`<ref>ClassName</ref><box>(x1,y1),(x2,y2)</box>`) rather than the
-`[x1,y1,x2,y2]` format our prompt asks for. This strongly suggests our current
-prompt does not match how CheXagent was trained to respond, and that its
-11.3% detection rate understates its real capability. **A corrected prompt
-that elicits CheXagent's native `<ref><box>` format should be tested before
-these numbers are used in any final comparison or publication.**
-
-### MAIRA-2: task-framing mismatch on whole-organ queries (not fully resolved)
-MAIRA-2's detection rate varies enormously by region — 7.3% for "right lung"
-vs 94.1% for "left mid lung zone" — and the pattern maps precisely onto
-whether the region name reads like a radiology-report *finding*. For "right
-lung"/"left lung" MAIRA-2 returns generic negative-findings report boilerplate
-("No confluent pulmonary infiltrates are seen...") with no box, since MAIRA-2
-is a *grounded reporting* model trained to link report findings to boxes, and
-a whole organ is rarely phrased as a finding in real reports. For
-"mediastinum," "trachea," and the lung zones, which do read like plausible
-report-sentence subjects, it correctly returns `<obj>findings in the
-X.<box>...</box></obj>`. **Reframing whole-organ queries to read like a
-report finding should be tested before treating 0.433/0.313 as final.**
-
-### MedGemma 1.5: mild, likely genuine left/right confusion
-A milder version of ChEX's pattern shows up on 3 of 15 regions (right upper
-lung zone, right lower lung zone, right hilar region). Since MedGemma's
-prompt is a plain-English sentence with no coordinate-mapping code involved
-(`f"Locate the {region}..."`), this is most likely a genuine zero-shot
-vision-language model limitation rather than a code bug, but it has not been
-independently confirmed the way ChEX's issue was.
-
-### One missing gold annotation
-Image `acb299f2-449ffbaf-848f8dc9-07d91ecc-73d7bc8d` has no gold box for
-"right lower lung zone." All 8 models still produced a prediction for it; the
-instance is excluded from Conditional Mean IoU and counted as 0 in
-Unconditional Mean IoU for every model equally, so it does not change any
-model's ranking relative to the others.
-
-### Costophrenic angles are not uniformly "hard" — check recall@0.1, not just IoU
-Raw IoU on the costophrenic angles is low for most models, but RadVLM's
-recall@0.1 (fraction of predictions with IoU ≥ 0.1) is 95% and its
-gold-center-inside-predicted-box rate is ~90% for both angles — meaning it
-does find the correct location almost every time; the low raw IoU reflects
-that a small anatomical target is punished disproportionately by IoU geometry
-for any small offset, not a real localization failure. Grounding DINO shows
-the opposite pattern (93-95% center-in-box despite 0% recall@0.1), which
-indicates a degenerate near-whole-image predicted box, not real localization.
-**Don't cite "costophrenic angle is inherently hard for every model" without
-this context** — it's true for most models but specifically false for RadVLM.
-
----
-
-## Repository layout
-
-```
-cxr-grounding-benchmark/
-├── cxr_common.py            # shared loaders, IoU, plotting, config resolution
-├── config.yaml              # all paths for full runs (no hardcoded paths in scripts)
-├── config_smoketest.yaml    # 8-image config → outputs_smoketest/
-├── evaluate.py              # aggregates every model's results_summary.csv
-├── compare_results.py
-├── setup_check.py           # pre-flight environment check (exit 1 on failure)
-├── run_aggregation.sh       # run once, after all model jobs finish
-├── requirements_*.txt       # one per conda env
-├── models/                  # one inference script per model (8)
-├── jobs/                    # Slurm job scripts (full runs, smoke tests, per-partition variants)
-├── debug/                   # one-off investigation scripts + their jobs
-├── figures/                 # figure / slide / comparison-grid generators
-└── *_report/                # per-model HTML report builders
-```
-
-`cxr_common.py` and the configs deliberately stay at the repo root. Model
-scripts do a plain `from cxr_common import ...`, so every job script exports
-`PYTHONPATH=<repo root>` before running `python models/<script>.py`. ChEX and
-BiomedParse are the exception: their job scripts copy the model script (plus
-`cxr_common.py`) into the externally cloned ChEX / BiomedParse repo and run it
-from there, because those codebases only import correctly from their own
-directories.
-
----
-
-## Running on Sharanga HPC
-
-```mermaid
-flowchart LR
-    A["Edit config.yaml"] --> B["python setup_check.py"]
-    B --> C["sbatch jobs/job_&lt;model&gt;_smoketest.sh<br/>(8 images)"]
-    C --> D{"Read raw model<br/>responses in .out log"}
-    D -->|looks wrong| E["Fix prompt / parser"] --> C
-    D -->|looks right| F["sbatch jobs/job_&lt;model&gt;.sh<br/>(2–3 partitions, cancel losers)"]
-    F --> G["./run_aggregation.sh<br/>(once, after all models finish)"]
-```
-
-All paths live in **`config.yaml`** at the repo root. Edit it once (GOLD_CSV,
-IMAGE_DIR, RADVLM_PATH, OUTPUT_DIR, MAX_IMAGES, HF_HOME, BIOMEDPARSE_REPO), then
-submit from the repo root:
-
-```bash
-python setup_check.py          # verify the environment first
-
-sbatch jobs/job_gdino.sh
-sbatch jobs/job_biovilt.sh
-sbatch jobs/job_chexagent.sh
-sbatch jobs/job_maira2.sh
-sbatch jobs/job_medgemma15.sh
-sbatch jobs/job_chex.sh
-sbatch jobs/job_biomedparse.sh
-sbatch jobs/job_radvlm.sh
-
-./run_aggregation.sh           # once, after every model has finished
-```
-
-Gated models (MAIRA-2, MedGemma) need `HF_TOKEN` set in your shell or a prior
-`huggingface-cli login` — **never hardcode a token in a job script.**
-
-Each job writes its `results_summary.csv` **incrementally** (one row per region)
-to `OUTPUT_DIR/<model>/`, so partial results survive a wall-time kill.
-
-**Always run the `*_smoketest` variant first** and read the raw model responses in
-the Slurm `.out` log by hand — every real bug found in this project
-(MedGemma's y-before-x coordinate order, CheXagent's placeholder echo, ChEX's
-laterality issue) was caught this way, never by trusting a plausible-looking
-IoU number.
-
-### HPC queue time and script efficiency
-Queue wait times are heavily contended and unpredictable (minutes to 47+ hours
-for the same tiny job).
-- Submit the same job to 2–3 partitions at once (e.g. `gpu_v100_2`,
-  `gpu_a100_8`, `gpu_h100_4`) and cancel the losers once one starts.
-- Encode the image once per image, not once per region — RadVLM's first version
-  re-ran the vision encoder for each of the 15 prompts.
-- Bump wall-time past what the smoke test's per-image rate implies —
-  MedGemma's first full run hit the 23h cap at 954/959 images.
 
 ---
 
@@ -517,6 +372,90 @@ Each model needs its own conda environment — do not mix them.
 
 ---
 
+## Repository layout
+
+```
+cxr-grounding-benchmark/
+├── cxr_common.py            # shared loaders, IoU, plotting, config resolution
+├── config.yaml              # all paths for full runs (no hardcoded paths in scripts)
+├── config_smoketest.yaml    # 8-image config → outputs_smoketest/
+├── evaluate.py              # aggregates every model's results_summary.csv
+├── compare_results.py
+├── setup_check.py           # pre-flight environment check (exit 1 on failure)
+├── run_aggregation.sh       # run once, after all model jobs finish
+├── requirements_*.txt       # one per conda env
+├── models/                  # one inference script per model (8)
+├── jobs/                    # Slurm job scripts (full runs, smoke tests, per-partition variants)
+├── debug/                   # one-off investigation scripts + their jobs
+├── figures/                 # figure / slide / comparison-grid generators
+└── *_report/                # per-model HTML report builders
+```
+
+`cxr_common.py` and the configs deliberately stay at the repo root. Model
+scripts do a plain `from cxr_common import ...`, so every job script exports
+`PYTHONPATH=<repo root>` before running `python models/<script>.py`. ChEX and
+BiomedParse are the exception: their job scripts copy the model script (plus
+`cxr_common.py`) into the externally cloned ChEX / BiomedParse repo and run it
+from there, because those codebases only import correctly from their own
+directories.
+
+---
+
+## Running on Sharanga HPC
+
+```mermaid
+flowchart LR
+    A["Edit config.yaml"] --> B["python setup_check.py"]
+    B --> C["sbatch jobs/job_&lt;model&gt;_smoketest.sh<br/>(8 images)"]
+    C --> D{"Read raw model<br/>responses in .out log"}
+    D -->|looks wrong| E["Fix prompt / parser"] --> C
+    D -->|looks right| F["sbatch jobs/job_&lt;model&gt;.sh<br/>(2–3 partitions, cancel losers)"]
+    F --> G["./run_aggregation.sh<br/>(once, after all models finish)"]
+```
+
+All paths live in **`config.yaml`** at the repo root. Edit it once (GOLD_CSV,
+IMAGE_DIR, RADVLM_PATH, OUTPUT_DIR, MAX_IMAGES, HF_HOME, BIOMEDPARSE_REPO), then
+submit from the repo root:
+
+```bash
+python setup_check.py          # verify the environment first
+
+sbatch jobs/job_gdino.sh
+sbatch jobs/job_biovilt.sh
+sbatch jobs/job_chexagent.sh
+sbatch jobs/job_maira2.sh
+sbatch jobs/job_medgemma15.sh
+sbatch jobs/job_chex.sh
+sbatch jobs/job_biomedparse.sh
+sbatch jobs/job_radvlm.sh
+
+./run_aggregation.sh           # once, after every model has finished
+```
+
+Gated models (MAIRA-2, MedGemma) need `HF_TOKEN` set in your shell or a prior
+`huggingface-cli login` — **never hardcode a token in a job script.**
+
+Each job writes its `results_summary.csv` **incrementally** (one row per region)
+to `OUTPUT_DIR/<model>/`, so partial results survive a wall-time kill.
+
+**Always run the `*_smoketest` variant first** and read the raw model responses in
+the Slurm `.out` log by hand — every real bug found in this project
+(MedGemma's y-before-x coordinate order, CheXagent's placeholder echo, ChEX's
+laterality issue) was caught this way, never by trusting a plausible-looking
+IoU number.
+
+### HPC queue time and script efficiency
+Queue wait times are heavily contended and unpredictable (minutes to 47+ hours
+for the same tiny job).
+- Submit the same job to 2–3 partitions at once (e.g. `gpu_v100_2`,
+  `gpu_a100_8`, `gpu_h100_4`) and cancel the losers once one starts.
+- Encode the image once per image, not once per region — RadVLM's first version
+  re-ran the vision encoder for each of the 15 prompts.
+- Bump wall-time past what the smoke test's per-image rate implies —
+  MedGemma's first full run hit the 23h cap at 954/959 images.
+
+---
+
 ## Data access
 
 - **Images + gold annotations:** [Chest ImaGenome](https://physionet.org/content/chest-imagenome/1.0.0/) and [MIMIC-CXR](https://physionet.org/content/mimic-cxr/2.0.0/) — PhysioNet credentialed access required
@@ -526,3 +465,90 @@ Neither images, annotations, nor model weights may be redistributed publicly
 per PhysioNet data use agreements. This repository contains only code —
 scripts, prompts, and parsers — so results are reproducible by anyone with
 their own PhysioNet access.
+
+---
+
+## Known issues and findings (read before citing per-model numbers)
+
+Found via a systematic audit (per-region left/right cross-checks, raw-response
+inspection, and source-level verification for ChEX) after the full runs. They
+are documented rather than silently fixed so anyone using this benchmark can see
+exactly what was checked.
+
+| Model | Issue | Status | Effect on numbers |
+|---|---|---|---|
+| ChEX | Left/right anatomical confusion | ✅ Verified genuine (source-traced) | Real model property — numbers stand |
+| CheXagent | Prompt-format mismatch (echoes placeholder) | ⚠️ Unresolved | 0.095 / 0.011 likely **understate** it |
+| MAIRA-2 | Task-framing mismatch on whole-organ regions | ⚠️ Unresolved | 0.433 / 0.313 likely **understate** it |
+| MedGemma 1.5 | Mild left/right confusion on 3 regions | Likely genuine, unconfirmed | Numbers stand |
+| All | 1 missing gold annotation | Handled identically | No ranking change |
+| All | Costophrenic-angle IoU is misleading | Context needed | Check recall@0.1 |
+
+### ChEX: genuine left/right confusion (verified against source, not a harness bug)
+ChEX's predictions for left-labeled regions systematically land near the
+correct *right*-side structure instead of the correct left-side one (e.g.
+"left lung" prediction matches "right lung" gold at IoU 0.41 vs only 0.16
+against its own "left lung" gold). This was traced through ChEX's actual
+`encode_prompts()`/`detect_prompts()` source
+(`chex/src/model/chex.py:448-515`): prompt order is correctly preserved
+end-to-end, box regression is conditioned purely on each prompt's own text
+embedding, and there is no fixed-vocabulary index lookup that could explain a
+harness-side swap. "Right lung" and "left lung" produce genuinely different
+(not duplicated) box coordinates on the same image, ruling out a simple
+aliasing bug. The most likely explanation is that ChEX's text encoder does not
+sufficiently separate "left" from "right" anatomical prompts to drive its box
+head to the correct hemisphere — a real property of the trained model, not
+something fixable in this evaluation harness. Reported as a finding, not
+patched.
+
+### CheXagent: likely prompt-format mismatch (not fully resolved — do not treat 0.095/0.011 as final)
+Inspecting raw model responses shows CheXagent frequently returns the literal
+placeholder text `"[x1, y1, x2, y2]"` from our prompt instruction instead of
+generating real coordinates. Critically, on the queries where it *does*
+ground successfully, it spontaneously uses its own native output format
+(`<ref>ClassName</ref><box>(x1,y1),(x2,y2)</box>`) rather than the
+`[x1,y1,x2,y2]` format our prompt asks for. This strongly suggests our current
+prompt does not match how CheXagent was trained to respond, and that its
+11.3% detection rate understates its real capability. **A corrected prompt
+that elicits CheXagent's native `<ref><box>` format should be tested before
+these numbers are used in any final comparison or publication.**
+
+### MAIRA-2: task-framing mismatch on whole-organ queries (not fully resolved)
+MAIRA-2's detection rate varies enormously by region — 7.3% for "right lung"
+vs 94.1% for "left mid lung zone" — and the pattern maps precisely onto
+whether the region name reads like a radiology-report *finding*. For "right
+lung"/"left lung" MAIRA-2 returns generic negative-findings report boilerplate
+("No confluent pulmonary infiltrates are seen...") with no box, since MAIRA-2
+is a *grounded reporting* model trained to link report findings to boxes, and
+a whole organ is rarely phrased as a finding in real reports. For
+"mediastinum," "trachea," and the lung zones, which do read like plausible
+report-sentence subjects, it correctly returns `<obj>findings in the
+X.<box>...</box></obj>`. **Reframing whole-organ queries to read like a
+report finding should be tested before treating 0.433/0.313 as final.**
+
+### MedGemma 1.5: mild, likely genuine left/right confusion
+A milder version of ChEX's pattern shows up on 3 of 15 regions (right upper
+lung zone, right lower lung zone, right hilar region). Since MedGemma's
+prompt is a plain-English sentence with no coordinate-mapping code involved
+(`f"Locate the {region}..."`), this is most likely a genuine zero-shot
+vision-language model limitation rather than a code bug, but it has not been
+independently confirmed the way ChEX's issue was.
+
+### One missing gold annotation
+Image `acb299f2-449ffbaf-848f8dc9-07d91ecc-73d7bc8d` has no gold box for
+"right lower lung zone." All 8 models still produced a prediction for it; the
+instance is excluded from Conditional Mean IoU and counted as 0 in
+Unconditional Mean IoU for every model equally, so it does not change any
+model's ranking relative to the others.
+
+### Costophrenic angles are not uniformly "hard" — check recall@0.1, not just IoU
+Raw IoU on the costophrenic angles is low for most models, but RadVLM's
+recall@0.1 (fraction of predictions with IoU ≥ 0.1) is 95% and its
+gold-center-inside-predicted-box rate is ~90% for both angles — meaning it
+does find the correct location almost every time; the low raw IoU reflects
+that a small anatomical target is punished disproportionately by IoU geometry
+for any small offset, not a real localization failure. Grounding DINO shows
+the opposite pattern (93-95% center-in-box despite 0% recall@0.1), which
+indicates a degenerate near-whole-image predicted box, not real localization.
+**Don't cite "costophrenic angle is inherently hard for every model" without
+this context** — it's true for most models but specifically false for RadVLM.
