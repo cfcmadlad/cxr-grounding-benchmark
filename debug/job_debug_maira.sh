@@ -16,4 +16,4 @@ export TRANSFORMERS_CACHE=/home/manik/pranjali/Aditya_project/.cache/huggingface
 # (never hardcode a real token in a script that goes into version control).
 # export HF_TOKEN=<your-token-here>   # or: huggingface-cli login
 cd /home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed
-python debug_maira_ground.py
+python debug/debug_maira_ground.py

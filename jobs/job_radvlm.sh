@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p gpu_a100_8
+#SBATCH -p gpu_v100_2
 #SBATCH --gres=gpu:1
 #SBATCH -N 1
 #SBATCH -n 1
@@ -25,7 +25,8 @@ export TRANSFORMERS_CACHE=/home/manik/pranjali/Aditya_project/.cache/huggingface
 
 cd /home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed
 
-python radvlm_medsam.py
+export PYTHONPATH="/home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed:${PYTHONPATH:-}"
+python models/radvlm_medsam.py
 
 # Aggregation deliberately does NOT run here any more. Having every job run
 # evaluate.py at the end raced against models that were still writing their

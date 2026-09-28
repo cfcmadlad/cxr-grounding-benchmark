@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p gpu_h100_4
+#SBATCH -p gpu_a100_8
 #SBATCH --gres=gpu:1
 #SBATCH -N 1
 #SBATCH -n 1
@@ -21,4 +21,5 @@ export CXR_CONFIG=/home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fi
 
 cd /home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed
 
-python radvlm_medsam.py
+export PYTHONPATH="/home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed:${PYTHONPATH:-}"
+python models/radvlm_medsam.py

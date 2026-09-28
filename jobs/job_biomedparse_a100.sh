@@ -40,11 +40,10 @@ cd /home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed
 
 # The BiomedParse custom classes are only importable with the repo dir as the
 # script dir, so copy the script (and shared module/config as a fallback) in.
-cp cxr_common.py config.yaml biomedparse_seg.py \
+cp cxr_common.py config.yaml models/biomedparse_seg.py \
    /home/manik/pranjali/Aditya_project/BiomedParse/
 
 cd /home/manik/pranjali/Aditya_project/BiomedParse
-echo "DEBUG: HF_TOKEN is set to: ${HF_TOKEN:0:10}... (length ${#HF_TOKEN})"
 python biomedparse_seg.py
 
 # Aggregation deliberately does NOT run here any more. Having every job run

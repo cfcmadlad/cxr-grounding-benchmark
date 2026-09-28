@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH -p gpu_h100_4
+#SBATCH --gres=gpu:1
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH --gres=gpu:1
-#SBATCH -t 0-23:00
+#SBATCH -t 1-06:00
 #SBATCH -o slurm.%j.out
 #SBATCH -e slurm.%j.err
 #SBATCH --mail-type=ALL
-#SBATCH --job-name="biovilt"
-#SBATCH --mem 8G
+#SBATCH --job-name="radvlm"
+#SBATCH --mem 40G
 
 # Fail the job on the first error, on an unset variable, and on any failure
 # inside a pipeline. Without this Slurm only reports the LAST command's exit
@@ -18,14 +18,15 @@
 set -euo pipefail
 
 source /apps/spack/opt/spack/linux-rocky8-zen2/gcc-11.2.0/anaconda3-2022.05-od5lltp3ijbed4uvsrut4fifckrgsbbf/etc/profile.d/conda.sh
-conda activate biovilt
+conda activate radvlm
 
 export HF_HOME=/home/manik/pranjali/Aditya_project/.cache/huggingface
 export TRANSFORMERS_CACHE=/home/manik/pranjali/Aditya_project/.cache/huggingface
 
 cd /home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed
 
-python biovilt_medsam.py
+export PYTHONPATH="/home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed:${PYTHONPATH:-}"
+python models/radvlm_medsam.py
 
 # Aggregation deliberately does NOT run here any more. Having every job run
 # evaluate.py at the end raced against models that were still writing their

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p gpu_rtx_pro_6000_6_csis_hyd
+#SBATCH -p gpu_v100_2
 #SBATCH --gres=gpu:1
 #SBATCH -N 1
 #SBATCH -n 1
@@ -23,4 +23,5 @@ export TRANSFORMERS_CACHE=/home/manik/pranjali/Aditya_project/.cache/huggingface
 export CXR_CONFIG=/home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed/config_smoketest.yaml
 
 cd /home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed
-python medgemma15_medsam.py
+export PYTHONPATH="/home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed:${PYTHONPATH:-}"
+python models/medgemma15_medsam.py

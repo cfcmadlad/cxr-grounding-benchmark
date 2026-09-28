@@ -15,4 +15,4 @@ source /apps/spack/opt/spack/linux-rocky8-zen2/gcc-11.2.0/anaconda3-2022.05-od5l
 conda activate gdino
 
 cd /home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed
-python debug_chexagent_parse.py
+python debug/debug_chexagent_parse.py

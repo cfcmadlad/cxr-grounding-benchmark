@@ -23,7 +23,8 @@ export TRANSFORMERS_CACHE=/home/manik/pranjali/Aditya_project/.cache/huggingface
 
 cd /home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed
 
+export PYTHONPATH="/home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed:${PYTHONPATH:-}"
 echo "PYTHONNOUSERSITE check:"
 PYTHONNOUSERSITE=1 python -c "import torch; print(torch.__file__)"
 
-python medgemma_smoketest.py
+python debug/medgemma_smoketest.py

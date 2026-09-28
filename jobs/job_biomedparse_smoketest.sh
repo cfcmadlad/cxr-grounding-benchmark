@@ -29,7 +29,7 @@ cd /home/manik/pranjali/Aditya_project/cxr-grounding-benchmark-fixed
 echo "PYTHONNOUSERSITE check:"
 PYTHONNOUSERSITE=1 python -c "import torch, numpy; print('torch', torch.__file__); print('numpy', numpy.__file__, numpy.__version__)"
 
-cp cxr_common.py config_smoketest.yaml biomedparse_seg.py \
+cp cxr_common.py config_smoketest.yaml models/biomedparse_seg.py \
    /home/manik/pranjali/Aditya_project/BiomedParse/
 
 cd /home/manik/pranjali/Aditya_project/BiomedParse
