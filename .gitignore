@@ -47,3 +47,11 @@ outputs_smoketest/
 
 # Old audit backups
 .audit_backup_*/
+
+# Local report-generation artifacts and gated model weights — contain real
+# patient image data (Chest ImaGenome/MIMIC-CXR derived) and/or PhysioNet-
+# gated model weights. Must never be committed per PhysioNet data use terms.
+RadVLM/
+all_models_report/
+biomedparse_report/
+chex_report/
