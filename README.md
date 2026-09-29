@@ -527,12 +527,15 @@ X.<box>...</box></obj>`. **Reframing whole-organ queries to read like a
 report finding should be tested before treating 0.433/0.313 as final.**
 
 ### MedGemma 1.5: mild, likely genuine left/right confusion
-A milder version of ChEX's pattern shows up on 3 of 15 regions (right upper
-lung zone, right lower lung zone, right hilar region). Since MedGemma's
+A milder version of ChEX's pattern shows up on 4 of 15 regions (left upper
+lung zone, left hilar region, right lung, right lower lung zone), using the
+threshold opposite-side gold IoU > own-side gold IoU + 0.02. Since MedGemma's
 prompt is a plain-English sentence with no coordinate-mapping code involved
 (`f"Locate the {region}..."`), this is most likely a genuine zero-shot
 vision-language model limitation rather than a code bug, but it has not been
-independently confirmed the way ChEX's issue was.
+independently confirmed the way ChEX's issue was. For reference at the same
+threshold: ChEX shows this on all 6 left-labeled regions (confirmed against
+source, see above); RadVLM shows it on none.
 
 ### One missing gold annotation
 Image `acb299f2-449ffbaf-848f8dc9-07d91ecc-73d7bc8d` has no gold box for
