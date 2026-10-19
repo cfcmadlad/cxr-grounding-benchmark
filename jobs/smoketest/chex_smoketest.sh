@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p gpu_rtx_pro_6000_6_csis_hyd
+#SBATCH -p gpu_v100_2
 #SBATCH --gres=gpu:1
 #SBATCH -N 1
 #SBATCH -n 1

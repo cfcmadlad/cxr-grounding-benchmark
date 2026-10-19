@@ -4,7 +4,7 @@ chexagent_medsam.py
 Self-contained script: CheXagent-8b + MedSAM for anatomical region grounding
 on the Chest ImaGenome gold subset.
 
-Requirements: see requirements_chexagent.txt
+Requirements: see requirements/chexagent.txt
 
 Model: StanfordAIMI/CheXagent-8b (open weights, no gated access needed)
 Paper: https://arxiv.org/abs/2401.12208

@@ -4,7 +4,7 @@ biovilt_medsam.py
 Self-contained script: BioViL-T + MedSAM for anatomical region grounding
 on the Chest ImaGenome gold subset.
 
-Requirements: see requirements_biovilt.txt
+Requirements: see requirements/biovilt.txt
 
 All paths are read from config.yaml at the repo root — nothing is hardcoded.
 

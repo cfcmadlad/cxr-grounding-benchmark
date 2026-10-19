@@ -51,7 +51,7 @@ if contains gdino "${ENVS_TO_BUILD[@]}"; then
     echo; echo "── [1/6] gdino ──"
     conda_env_exists gdino || conda create -n gdino python=3.10 -y
     conda run -n gdino pip install torch torchvision --index-url "$TORCH_INDEX_URL"
-    conda run -n gdino pip install -r requirements_grounding_dino.txt
+    conda run -n gdino pip install -r requirements/grounding_dino.txt
     echo "gdino env ready."
 fi
 
@@ -60,7 +60,7 @@ if contains biovilt "${ENVS_TO_BUILD[@]}"; then
     echo; echo "── [2/6] biovilt ──"
     conda_env_exists biovilt || conda create -n biovilt python=3.10 -y
     conda run -n biovilt pip install torch torchvision --index-url "$TORCH_INDEX_URL"
-    conda run -n biovilt pip install -r requirements_biovilt.txt
+    conda run -n biovilt pip install -r requirements/biovilt.txt
     echo "biovilt env ready."
 fi
 
@@ -69,7 +69,7 @@ if contains radvlm "${ENVS_TO_BUILD[@]}"; then
     echo; echo "── [3/6] radvlm ──"
     conda_env_exists radvlm || conda create -n radvlm python=3.10 -y
     conda run -n radvlm pip install torch torchvision --index-url "$TORCH_INDEX_URL"
-    conda run -n radvlm pip install -r requirements_radvlm.txt
+    conda run -n radvlm pip install -r requirements/radvlm.txt
     echo "radvlm env ready."
     echo "NOTE: RadVLM weights require separate PhysioNet credentialed access:"
     echo "      https://physionet.org/content/radvlm-model/1.0.0/"
@@ -82,7 +82,7 @@ if contains maira2 "${ENVS_TO_BUILD[@]}"; then
     echo; echo "── [4/6] maira2 ──"
     conda_env_exists maira2 || conda create -n maira2 python=3.10 -y
     conda run -n maira2 pip install torch torchvision --index-url "$TORCH_INDEX_URL"
-    conda run -n maira2 pip install -r requirements_maira2.txt
+    conda run -n maira2 pip install -r requirements/maira2.txt
     echo "maira2 env ready."
     echo "NOTE: MAIRA-2 requires one-time gated HF access:"
     echo "        1. Visit https://huggingface.co/microsoft/maira-2 and click"
@@ -97,7 +97,7 @@ if contains chexagent "${ENVS_TO_BUILD[@]}"; then
     echo; echo "── [5/6] chexagent ──"
     conda_env_exists chexagent || conda create -n chexagent python=3.10 -y
     conda run -n chexagent pip install torch torchvision --index-url "$TORCH_INDEX_URL"
-    conda run -n chexagent pip install -r requirements_chexagent.txt
+    conda run -n chexagent pip install -r requirements/chexagent.txt
     echo "chexagent env ready."
 fi
 
@@ -117,7 +117,7 @@ if contains biomedparse "${ENVS_TO_BUILD[@]}"; then
         pytorch torchvision torchaudio pytorch-cuda=12.4
 
     ( cd "$BIOMEDPARSE_REPO_DIR" && conda run -n biomedparse pip install -r assets/requirements/requirements.txt )
-    conda run -n biomedparse pip install -r requirements_biomedparse.txt
+    conda run -n biomedparse pip install -r requirements/biomedparse.txt
 
     # biomedparse_seg.py and cxr_common.py must live inside the BiomedParse
     # repo checkout for its custom `modeling`/`utilities` imports to resolve.

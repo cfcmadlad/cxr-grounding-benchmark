@@ -4,7 +4,7 @@ grounding_dino_medsam.py
 Self-contained script: Grounding DINO + MedSAM as a formal baseline for
 anatomical region grounding on the Chest ImaGenome gold subset.
 
-Requirements: see requirements_grounding_dino.txt
+Requirements: see requirements/grounding_dino.txt
 
 Model: IDEA-Research/grounding-dino-tiny (open weights, no gated access)
        wanglab/medsam-vit-base (MedSAM, open weights)

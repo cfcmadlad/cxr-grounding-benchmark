@@ -214,7 +214,7 @@ detected box to produce segmentation masks.
 ```bash
 conda create -n gdino python=3.10 -y && conda activate gdino
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements_grounding_dino.txt
+pip install -r requirements/grounding_dino.txt
 PYTHONPATH=. python models/grounding_dino_medsam.py
 ```
 </details>
@@ -232,7 +232,7 @@ component.
 ```bash
 conda create -n biovilt python=3.10 -y && conda activate biovilt
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements_biovilt.txt
+pip install -r requirements/biovilt.txt
 PYTHONPATH=. python models/biovilt_medsam.py
 ```
 </details>
@@ -252,7 +252,7 @@ strongest model in this benchmark by a wide margin.
 ```bash
 conda create -n radvlm python=3.10 -y && conda activate radvlm
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements_radvlm.txt
+pip install -r requirements/radvlm.txt
 PYTHONPATH=. python models/radvlm_medsam.py
 ```
 </details>
@@ -271,7 +271,7 @@ mismatch rather than a pure capability gap.
 ```bash
 conda create -n maira2 python=3.10 -y && conda activate maira2
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements_maira2.txt
+pip install -r requirements/maira2.txt
 huggingface-cli login
 PYTHONPATH=. python models/maira2_medsam.py
 ```
@@ -289,7 +289,7 @@ mismatch rather than a pure capability gap.
 ```bash
 conda create -n chexagent python=3.10 -y && conda activate chexagent
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements_chexagent.txt
+pip install -r requirements/chexagent.txt
 PYTHONPATH=. python models/chexagent_medsam.py
 ```
 </details>
@@ -350,7 +350,7 @@ git clone https://github.com/microsoft/BiomedParse.git && cd BiomedParse
 conda create -n biomedparse python=3.9.19 -y && conda activate biomedparse
 conda install pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvidia -y
 pip install -r assets/requirements/requirements.txt
-pip install -r requirements_biomedparse.txt
+pip install -r requirements/biomedparse.txt
 sbatch jobs/job_biomedparse.sh   # from the benchmark repo root
 ```
 </details>
@@ -383,12 +383,13 @@ cxr-grounding-benchmark/
 ├── compare_results.py
 ├── setup_check.py           # pre-flight environment check (exit 1 on failure)
 ├── run_aggregation.sh       # run once, after all model jobs finish
-├── requirements_*.txt       # one per conda env
-├── models/                  # one inference script per model (8)
-├── jobs/                    # Slurm job scripts (full runs, smoke tests, per-partition variants)
-├── debug/                   # one-off investigation scripts + their jobs
+├── requirements/            # one file per conda env
+├── models/                  # one inference script per model (8) + RadVLM 29-region / 22-finding scripts
+├── jobs/                    # Slurm job scripts, one per model (partition chosen with sbatch -p)
+│   └── smoketest/           # 8-image smoke-test jobs
 ├── figures/                 # figure / slide / comparison-grid generators
-└── *_report/                # per-model HTML report builders
+├── docs/                    # BUGS_FOUND, COMPATIBILITY_REPORT, RUN_ON_HPC
+└── reports/                 # local only, git-ignored (contains MIMIC-CXR images)
 ```
 
 `cxr_common.py` and the configs deliberately stay at the repo root. Model
@@ -406,7 +407,7 @@ directories.
 ```mermaid
 flowchart LR
     A["Edit config.yaml"] --> B["python setup_check.py"]
-    B --> C["sbatch jobs/job_&lt;model&gt;_smoketest.sh<br/>(8 images)"]
+    B --> C["sbatch jobs/smoketest/&lt;model&gt;_smoketest.sh<br/>(8 images)"]
     C --> D{"Read raw model<br/>responses in .out log"}
     D -->|looks wrong| E["Fix prompt / parser"] --> C
     D -->|looks right| F["sbatch jobs/job_&lt;model&gt;.sh<br/>(2–3 partitions, cancel losers)"]
@@ -447,8 +448,10 @@ IoU number.
 ### HPC queue time and script efficiency
 Queue wait times are heavily contended and unpredictable (minutes to 47+ hours
 for the same tiny job).
-- Submit the same job to 2–3 partitions at once (e.g. `gpu_v100_2`,
-  `gpu_a100_8`, `gpu_h100_4`) and cancel the losers once one starts.
+- Submit the same job to 2–3 partitions at once and cancel the losers once one
+  starts. The partition is chosen at submit time, so one script serves all:
+  `sbatch -p gpu_a100_8 jobs/job_<model>.sh`, `-p gpu_h100_4`, `-p gpu_v100_2`, ...
+  (a `-p` on the command line overrides the `#SBATCH -p` line in the script).
 - Encode the image once per image, not once per region — RadVLM's first version
   re-ran the vision encoder for each of the 15 prompts.
 - Bump wall-time past what the smoke test's per-image rate implies —
