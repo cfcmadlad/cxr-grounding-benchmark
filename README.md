@@ -88,6 +88,43 @@ identically for every model (see Known Issues).
 
 ---
 
+## RadVLM extension: 29 regions and 22 findings
+
+Two further RadVLM runs on the same 959 images. Both use one shared image pass per
+image, so a full run takes about 2 h on one GPU instead of 25-35 h
+(`models/radvlm_29regions.py`, `models/radvlm_22findings.py`; the fast path is
+checked against plain `generate()` before every fresh run).
+
+**29 anatomical regions (scored).** All 29 Chest ImaGenome regions, 27,811 queries.
+27 regions are scored: the 26 regions present in the gold CSV plus *mediastinum*,
+whose gold box is **derived** (the rectangle enclosing the upper-mediastinum and
+cardiac-silhouette boxes, our reading of the dataset footnote). *Spine* and
+*abdomen* have no gold boxes, so their predictions are recorded but not scored.
+26 malformed gold boxes (12 images) are excluded.
+
+| | |
+|---|---|
+| Mean IoU, 27 scored regions (25,856 queries) | **0.761** |
+| Queries with IoU >= 0.5 | 90.6% |
+| Best / worst region | right lung 0.903 / carina 0.462 |
+
+Caveats: the other seven models have not been re-scored with the derived mediastinum
+gold and the malformed-box exclusion, so do not compare them directly with this table.
+RadVLM was trained on Chest ImaGenome boxes; whether these 959 images overlap its
+training data has **not** been checked. The box parser misses negative coordinates, so
+only 580 of 959 spine boxes were parsed (no effect on scored regions).
+
+**22 VinDr-CXR findings (predictions only, not scored).** Our images have no gold boxes
+for findings, so this run records what RadVLM says and does not measure accuracy.
+Per image, each finding gets RadVLM's own single-finding prompt ("Where is the X
+located...") and one grouped detection prompt ("Are abnormalities present...?"). The
+single-finding prompt returned a box for every finding on every image, so it is not a
+presence signal; the detection prompt is the model's present/absent call. Scoring needs
+the Chest ImaGenome gold finding labels (`models/radvlm22_score.py`, weak
+region-level check) or the VinDr-CXR test set (real IoU).
+
+---
+
 ## How the benchmark works
 
 ```mermaid
