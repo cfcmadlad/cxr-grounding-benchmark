@@ -95,11 +95,79 @@
   verified     = {partial}
 }
 
-@misc{wu2021chestimagenome,
-  title        = {Chest {ImaGenome} Dataset},
-  author       = {Wu, Joy and others},
+@inproceedings{wu2021chestimagenome,
+  author       = {Wu, Joy T. and others},
+  title        = {Chest {ImaGenome} Dataset for Clinical Reasoning},
+  booktitle    = {Proc. NeurIPS Datasets and Benchmarks Track},
   year         = {2021},
-  howpublished = {PhysioNet},
-  note         = {UNVERIFIED: full author list, exact title, version and the associated NeurIPS Datasets and Benchmarks paper; cited as Wu et al. 2021 in the MedGemma 1.5 report},
+  note         = {PhysioNet resource doi:10.13026/wv01-y230; full author list and page numbers UNVERIFIED; first author and the presence of Moradi and Celi among the authors come from a search summary only},
+  verified     = {partial}
+}
+
+@inproceedings{boecking2022mscxr,
+  author       = {Boecking, Benedikt and Usuyama, Naoto and Bannur, Shruthi and others},
+  title        = {Making the Most of Text Semantics to Improve Biomedical Vision-Language Processing},
+  booktitle    = {Computer Vision -- ECCV 2022},
+  series       = {LNCS},
+  volume       = {13696},
+  pages        = {1--21},
+  year         = {2022},
+  doi          = {10.1007/978-3-031-20059-5_1},
+  note         = {arXiv:2204.09817; introduces CXR-BERT and the MS-CXR phrase grounding dataset; MS-CXR on PhysioNet v1.1.0 doi:10.13026/9g2z-jg61, 1162 image-sentence pairs over eight findings; remaining authors UNVERIFIED},
+  verified     = {partial}
+}
+
+@article{nguyen2022vindrcxr,
+  author       = {Nguyen, Ha Q. and others},
+  title        = {{VinDr-CXR}: An open dataset of chest {X}-rays with radiologist's annotations},
+  journal      = {Scientific Data},
+  year         = {2022},
+  doi          = {10.1038/s41597-022-01498-w},
+  note         = {arXiv:2012.15029; first-author initials and volume UNVERIFIED; 18,000 PA scans released (15,000 train, 3,000 test), 22 local and 6 global labels},
+  verified     = {partial}
+}
+
+@misc{padchestgr2024,
+  author       = {{Authors not verified}},
+  title        = {{PadChest-GR}: A Bilingual Chest {X}-ray Dataset for Grounded Radiology Report Generation},
+  year         = {2024},
+  howpublished = {arXiv:2411.05085; later NEJM AI vol. 2, issue 7},
+  note         = {4,555 studies (3,099 abnormal, 1,456 normal), 14 radiologists, data on request via BIMCV; author list and NEJM AI year UNVERIFIED},
+  verified     = {partial}
+}
+
+@misc{zhang2026chexone,
+  author       = {Zhang, Yabin and Langlotz, Curtis and others},
+  title        = {A Reasoning-Enabled Vision-Language Foundation Model for Chest {X}-ray Interpretation},
+  year         = {2026},
+  howpublished = {arXiv:2604.00493},
+  note         = {the model is called CheXOne; submitted 1 Apr 2026; details beyond the abstract UNVERIFIED},
+  verified     = {partial}
+}
+
+@misc{psfmed2026,
+  author       = {{Authors not verified}},
+  title        = {{PSF-Med}: Measuring and Explaining Paraphrase Sensitivity},
+  year         = {2026},
+  howpublished = {arXiv:2602.21428},
+  note         = {full title, authors and venue UNVERIFIED; yes/no answer flip rates of 8 to 58 percent across six medical VLMs per a search summary},
+  verified     = {no}
+}
+
+@misc{xbench2025,
+  author       = {{Authors not verified}},
+  title        = {{XBench}: A Comprehensive Benchmark for Visual-Language [title truncated in the search result, UNVERIFIED]},
+  year         = {2025},
+  howpublished = {arXiv:2510.19599},
+  note         = {full title, authors and venue UNVERIFIED; evaluates localisation with Pointing Game, Dice and IoU per a search summary},
+  verified     = {no}
+}
+
+@misc{medground2026,
+  author       = {{Authors not verified}},
+  title        = {{MedGround}: Bridging the Evidence Gap in Medical Vision-Language Models with Verified Grounding Data},
+  year         = {2026},
+  howpublished = {arXiv:2601.06847},
+  note         = {authors and venue UNVERIFIED; reports a laterality failure mode in its verification step per a search summary},
   verified     = {no}
 }
