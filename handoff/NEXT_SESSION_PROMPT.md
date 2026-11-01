@@ -4,7 +4,27 @@ You are taking over a running research project from a cloud session that had no 
 
 First action: confirm in 5 lines what you understood, state whether you have a shell on the cluster (run `hostname`; the login node is `hpc01`), then start at section 10 step 1. If you have a shell, run the commands yourself and report concisely. If you do not, hand the user one stage at a time as described in section 1.
 
-## 1. The user and how to talk to them
+## 0. Autonomous operating mode (this overrides the stage-by-stage handoff style in section 1 whenever you have a cluster shell)
+
+The user does not want to copy and paste anything. The earlier cloud session had no route to the cluster, which is the only reason commands were handed over one block at a time. If you can run commands on the cluster, you run them yourself. Do not ask the user to paste output that you can read from the cluster, do not wait for confirmation between stages, and do not stop at the first failure.
+
+Step 0, install the autopilot (not yet on the cluster): in the project root, run `git fetch origin claude/busy-planck-qjjrbe` and `git show origin/claude/busy-planck-qjjrbe:handoff/hpc_snapshot/autopilot.py > hpc/autopilot.py`. If the project root is not a clone of this repo, copy the file from the branch by any other means. `autopilot.py` was tested only against a mocked cluster; read it once, run it without arguments (dry run, prints the plan and submits nothing), then use `--submit`.
+
+What `python hpc/autopilot.py --submit` does each time it runs: reads `outputs_final/jobs.log` and `squeue`, counts finished shard files against the expected totals, treats shards covered by a queued or running job as covered, and resubmits the remaining missing shards as combined jobs (flip then native phases in one job where the shard lists match, J0 only where J0 files are missing and no live job has it). It picks gpu_v100_2 for ChEX, otherwise the less loaded of gpu_h100_4 and gpu_h200_8, stays under 8 active jobs, stops if free inodes fall below 100,000, stops submitting for a model after 2 resubmissions without new shards (marks it blocked), and rewrites `outputs_final/manifest.json` and `autopilot_state.json`. It never cancels anything.
+
+Self-pacing loop while jobs are pending or running: schedule yourself to wake every 20 to 30 minutes (use ScheduleWakeup in /loop dynamic mode, or CronCreate). Each tick: run `python hpc/autopilot.py --submit`, then `bash hpc/status.sh 2>&1 | cut -c1-200`, read tracebacks in new logs and fix causes (environment, cache, partition) within the cluster rules, then run any analysis that has become possible with the shards that exist. Keep going until all deliverables in section 10 are done. After each tick report in at most five lines: what finished, what is running, what you did, what only the user can unblock.
+
+Decision defaults, so you never block waiting for the user:
+- Flip probe definition: compute all three golds from section 9 (G_orig, G_pos, G_struct) and report all of them. Mention once that the user should confirm which one the paper treats as primary.
+- Phase 1 CSVs: regenerate `per_region_iou.csv` and `per_region_detection_rate.csv` yourself from `outputs/*/results_summary.csv` in the required layout (8 rows, unnamed first column with the model name, 15 region columns); do not wait for the user to paste them. Compare with the remembered figures in section 2 and report any difference.
+- Patient ids for bootstrap: derive from the available mappings (section 9, C7). If none exists, say so once, run image-level bootstrap labelled as such, and list the file the user must supply.
+- Partitions: never A100 unless the queue is empty of H100 and H200 capacity, never RTX Blackwell for the old environments.
+- Compute shortfall: cut order is MedGemma J3, then MedGemma J1, then MedGemma J2, then J1 for the other models. State the cut in the report.
+- Model fails twice: mark it blocked in `manifest.json`, give the exact diagnostic command in the report, continue with other work.
+
+What only the human can do (prepare everything so the work resumes the moment it is done, and keep working on everything else meanwhile): (1) Chest ImaGenome files and the RadVLM Instruction Dataset JSON from PhysioNet need the user's own credentialed login and signed data use agreements, and Pranjali's agreement to store them on the shared account; never ask for or handle a password, give the user the exact `wget` lines to run themselves; (2) Pranjali's replies; (3) the final choice of primary flip definition. When PhysioNet files appear on disk (check `data/` and the user's home for them), run C2, C3, C4 and C6 automatically.
+
+## 1. The user and how to talk to them (applies to everything you say or write; the "one stage at a time, wait for pasted output" rule applies only if you have no cluster shell)
 
 Aditya, third year undergraduate, BITS Pilani Hyderabad campus, electrical and electronics engineering with a data science minor. Knows deep learning and Python well. Not comfortable with the Linux terminal, SLURM or SSH. Works from a Windows laptop in Command Prompt over SSH (`ssh manik@hpc.bits-hyderabad.ac.in`). The login node logs out after about 25 minutes idle; submitted jobs keep running.
 
